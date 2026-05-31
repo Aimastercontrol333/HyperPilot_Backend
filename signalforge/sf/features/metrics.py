@@ -1,0 +1,226 @@
+"""
+Feature engineering: raw fills -> round-trip trades -> behavioral metrics.
+
+Hyperliquid fills carry `dir` ("Open Long", "Close Short", ...) and `closedPnl`,
+which lets us stitch a position's opens and closes into round-trips without
+guessing. From those round-trips we derive the inputs the Safety Score needs:
+drawdown, per-trade loss distribution, leverage proxy, return series, cadence,
+martingale signal, etc.
+
+Leverage caveat (be honest): fills don't include leverage directly. We compute
+a notional/equity proxy and, where possible, cross-check against the current
+clearinghouse leverage. It's an approximation and flagged as such.
+"""
+from __future__ import annotations
+
+import math
+import statistics as stats
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class RoundTrip:
+    coin: str
+    direction: str          # "long" | "short"
+    open_ms: int
+    close_ms: int
+    qty: float              # absolute base size
+    avg_entry: float
+    avg_exit: float
+    closed_pnl: float       # realized PnL (USD) net of HL fees in `fee`
+    fees: float
+    notional: float         # avg_entry * qty
+    ret_pct: float          # closed_pnl / notional * 100
+
+    @property
+    def hold_s(self) -> float:
+        return max((self.close_ms - self.open_ms) / 1000.0, 0.0)
+
+
+def _is_open(dir_str: str) -> bool:
+    return dir_str.startswith("Open")
+
+
+def _dir_to_side(dir_str: str) -> str:
+    return "long" if "Long" in dir_str else "short"
+
+
+def build_round_trips(fills: list[dict]) -> list[RoundTrip]:
+    """
+    Walk fills per coin, maintaining running position. When a position returns to
+    (near) flat, emit a RoundTrip. Uses `closedPnl` from close fills for realized
+    PnL so we don't have to model fees twice.
+    """
+    fills = sorted(fills, key=lambda f: int(f["time"]))
+    trips: list[RoundTrip] = []
+    # per-coin open lot accumulator
+    book: dict[str, dict[str, Any]] = {}
+
+    for f in fills:
+        coin = f["coin"]
+        dirs = f.get("dir", "")
+        if not dirs or "Long" not in dirs and "Short" not in dirs:
+            continue
+        px = float(f["px"]); sz = float(f["sz"])
+        t = int(f["time"]); fee = float(f.get("fee", 0) or 0)
+        cpnl = float(f.get("closedPnl", 0) or 0)
+        side = _dir_to_side(dirs)
+        st = book.get(coin)
+
+        if _is_open(dirs):
+            if st is None or st["qty"] == 0:
+                book[coin] = {"side": side, "qty": sz, "entry_notional": px * sz,
+                              "open_ms": t, "fees": fee}
+            else:
+                # adding to existing position (same side assumed for opens)
+                st["qty"] += sz
+                st["entry_notional"] += px * sz
+                st["fees"] += fee
+        else:  # Close
+            if st is None or st["qty"] == 0:
+                continue  # close without a tracked open (history boundary) -> skip
+            close_qty = min(sz, st["qty"])
+            avg_entry = st["entry_notional"] / st["qty"] if st["qty"] else px
+            st["qty"] -= close_qty
+            st["fees"] += fee
+            st["_close_notional"] = st.get("_close_notional", 0.0) + px * close_qty
+            st["_close_qty"] = st.get("_close_qty", 0.0) + close_qty
+            st["_pnl"] = st.get("_pnl", 0.0) + cpnl
+            if st["qty"] <= 1e-9:  # flat -> emit round trip
+                cq = st["_close_qty"]
+                avg_exit = st["_close_notional"] / cq if cq else px
+                notional = avg_entry * cq
+                trips.append(RoundTrip(
+                    coin=coin, direction=st["side"], open_ms=st["open_ms"], close_ms=t,
+                    qty=cq, avg_entry=avg_entry, avg_exit=avg_exit,
+                    closed_pnl=st["_pnl"], fees=st["fees"], notional=notional,
+                    ret_pct=(st["_pnl"] / notional * 100.0) if notional else 0.0,
+                ))
+                book[coin] = {"side": side, "qty": 0}
+    return trips
+
+
+@dataclass
+class WalletMetrics:
+    address: str
+    n_trades: int
+    history_days: float
+    win_rate: float
+    avg_ret_pct: float
+    expectancy_pct: float            # mean per-trade return (the real edge metric)
+    max_single_loss_pct: float       # worst single round-trip (abs)
+    max_drawdown_pct: float          # equity-curve drawdown
+    sharpe: float
+    sortino: float
+    avg_leverage_proxy: float
+    max_leverage_proxy: float
+    pnl_consistency: float           # 0..1, 1 = very steady
+    frequency_cv: float              # coefficient of variation of inter-trade gaps
+    martingale_score: float          # 0..1, 1 = strong martingale (bad)
+    liquidations: int
+    cum_return_pct: float
+    archetype: str
+    extra: dict = field(default_factory=dict)
+
+
+def _equity_curve(trips: list[RoundTrip]) -> list[float]:
+    eq, cur = [], 0.0
+    for t in trips:
+        cur += t.ret_pct          # in "R-ish" units of notional %
+        eq.append(cur)
+    return eq
+
+
+def _max_drawdown(eq: list[float]) -> float:
+    peak, mdd = -1e18, 0.0
+    for v in eq:
+        peak = max(peak, v)
+        mdd = max(mdd, peak - v)
+    return mdd
+
+
+def _classify(direction_mix: float, avg_hold_h: float, freq_per_day: float,
+              avg_lev: float) -> str:
+    if avg_hold_h < 1 and freq_per_day > 8:
+        return "Scalper"
+    if avg_hold_h < 8 and freq_per_day > 2:
+        return "Momentum"
+    if avg_hold_h > 72:
+        return "Position"
+    if avg_lev <= 3 and avg_hold_h > 24:
+        return "Conservative"
+    if freq_per_day < 1:
+        return "Swing"
+    return "Swing"
+
+
+def compute_metrics(address: str, trips: list[RoundTrip],
+                    account_value: float | None = None,
+                    liquidations: int = 0) -> WalletMetrics | None:
+    if not trips:
+        return None
+    rets = [t.ret_pct for t in trips]
+    n = len(trips)
+    span_days = max((trips[-1].close_ms - trips[0].open_ms) / 86_400_000.0, 1e-6)
+    wins = [r for r in rets if r > 0]
+    losses = [r for r in rets if r < 0]
+    win_rate = len(wins) / n
+    avg_ret = stats.fmean(rets)
+    mean = avg_ret
+    sd = stats.pstdev(rets) if n > 1 else 0.0
+    downside = [min(r, 0) for r in rets]
+    dsd = (sum(d * d for d in downside) / n) ** 0.5 if n else 0.0
+    # annualize-ish per trade (kept simple + comparable across wallets)
+    sharpe = (mean / sd * math.sqrt(n / span_days * 365)) if sd > 0 else 0.0
+    sortino = (mean / dsd * math.sqrt(n / span_days * 365)) if dsd > 0 else 0.0
+
+    eq = _equity_curve(trips)
+    mdd = _max_drawdown(eq)
+    max_single_loss = abs(min(rets)) if losses else 0.0
+
+    # leverage proxy: trade notional vs account value (if known), else relative
+    if account_value and account_value > 0:
+        levs = [t.notional / account_value for t in trips]
+    else:
+        med_notional = stats.median([t.notional for t in trips]) or 1.0
+        levs = [t.notional / med_notional for t in trips]  # relative units
+    avg_lev = stats.fmean(levs)
+    max_lev = max(levs)
+
+    # pnl consistency: 1 - normalized volatility of returns, clamped
+    pnl_consistency = max(0.0, 1.0 - (sd / (abs(mean) + abs(sd) + 1e-9)))
+
+    # cadence regularity
+    gaps = [(trips[i].open_ms - trips[i - 1].close_ms) / 1000.0 for i in range(1, n)]
+    gaps = [g for g in gaps if g >= 0]
+    if len(gaps) > 1 and stats.fmean(gaps) > 0:
+        freq_cv = stats.pstdev(gaps) / stats.fmean(gaps)
+    else:
+        freq_cv = 1.0
+
+    # martingale: do sizes increase right after losses?
+    mart_hits = 0; mart_chances = 0
+    for i in range(1, n):
+        if trips[i - 1].ret_pct < 0:
+            mart_chances += 1
+            if trips[i].notional > trips[i - 1].notional * 1.5:
+                mart_hits += 1
+    martingale = (mart_hits / mart_chances) if mart_chances else 0.0
+
+    avg_hold_h = stats.fmean([t.hold_s for t in trips]) / 3600.0
+    freq_per_day = n / span_days
+    long_share = sum(1 for t in trips if t.direction == "long") / n
+    archetype = _classify(long_share, avg_hold_h, freq_per_day, avg_lev)
+
+    return WalletMetrics(
+        address=address, n_trades=n, history_days=span_days, win_rate=win_rate,
+        avg_ret_pct=avg_ret, expectancy_pct=avg_ret, max_single_loss_pct=max_single_loss,
+        max_drawdown_pct=mdd, sharpe=sharpe, sortino=sortino,
+        avg_leverage_proxy=avg_lev, max_leverage_proxy=max_lev,
+        pnl_consistency=pnl_consistency, frequency_cv=freq_cv,
+        martingale_score=martingale, liquidations=liquidations,
+        cum_return_pct=eq[-1] if eq else 0.0, archetype=archetype,
+        extra={"avg_hold_h": avg_hold_h, "freq_per_day": freq_per_day,
+               "leverage_is_proxy": account_value is None},
+    )
