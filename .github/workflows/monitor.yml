@@ -1,0 +1,31 @@
+# HyperPilot — Live backend health monitor
+# Runs on a schedule and pings the live backend. If it is DOWN or STALE the job
+# FAILS, and GitHub emails you (make sure Actions notifications are on:
+# GitHub → Settings → Notifications → Actions). Also runnable on demand from the
+# Actions tab ("Run workflow").
+# Goes at:  .github/workflows/monitor.yml   (repo root, NOT inside signalforge/)
+#
+# Optional: set repo variable HYPERPILOT_URL (Settings → Secrets and variables →
+# Actions → Variables) to override the backend URL below.
+name: Backend health monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 min (UTC); shared runners may delay a little
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    env:
+      URL: ${{ vars.HYPERPILOT_URL || 'https://hyperpilot-backend.onrender.com' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Liveness + freshness (fails -> email alert)
+        run: python signalforge/monitor.py "$URL"
+      - name: Data consistency (informational; never blocks the alert)
+        continue-on-error: true
+        run: python signalforge/selfcheck.py "$URL"
