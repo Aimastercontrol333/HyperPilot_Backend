@@ -1,0 +1,27 @@
+# HyperPilot — Continuous Integration
+# Runs on every push and pull request. Compiles all modules (catches syntax
+# errors before they reach Render) and runs the offline engine smoke test.
+# Goes at:  .github/workflows/ci.yml   (repo root, NOT inside signalforge/)
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: signalforge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile every module (fail fast on syntax errors)
+        run: python -m py_compile sf/*.py sf/*/*.py selfcheck.py smoke_test.py monitor.py
+      - name: Run the offline engine smoke test
+        run: python smoke_test.py
