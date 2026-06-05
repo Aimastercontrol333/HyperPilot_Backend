@@ -140,7 +140,12 @@ def upsert_score(conn: sqlite3.Connection, sr) -> None:
                      "sortino": m.sortino if m else None,
                      "history_days": m.history_days if m else None,
                      "max_single_loss": m.max_single_loss_pct if m else None,
-                     "est_cost": m.est_follower_cost_pct if m else None})),
+                     "est_cost": m.est_follower_cost_pct if m else None,
+                     "account_value_usd": (m.account_value_usd if m else None),
+                     "realized_pnl_usd": (m.realized_pnl_usd if m else None),
+                     "days_since_last_trade": (m.days_since_last_trade if m else None),
+                     "single_trade_dominance": (m.single_trade_dominance if m else None),
+                     "equity_curve_quality": (m.equity_curve_quality if m else None)})),
     )
     conn.commit()
 
@@ -173,6 +178,9 @@ def all_scores(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
             "n_trades": r["n_trades"],
             "history_days": round(d["history_days"], 0) if d.get("history_days") is not None else None,
             "max_single_loss_pct": round(d["max_single_loss"], 1) if d.get("max_single_loss") is not None else None,
+            "realized_pnl_usd": round(d["realized_pnl_usd"]) if d.get("realized_pnl_usd") is not None else None,
+            "days_since_last_trade": round(d["days_since_last_trade"], 1) if d.get("days_since_last_trade") is not None else None,
+            "equity_curve_quality": round(d["equity_curve_quality"], 2) if d.get("equity_curve_quality") is not None else None,
         })
     return out
 
@@ -242,6 +250,9 @@ def realign_eligibility(conn: sqlite3.Connection, gate: dict) -> int:
         hist, lev, shp, msl = d.get("history_days"), d.get("avg_lev"), d.get("sharpe"), d.get("max_single_loss")
         dd, exp = r["max_dd"], r["expectancy"]
         est_cost = d.get("est_cost")
+        bal = d.get("account_value_usd"); rpnl = d.get("realized_pnl_usd")
+        dsl = d.get("days_since_last_trade"); dom = d.get("single_trade_dominance")
+        eqq = d.get("equity_curve_quality")
         exp_floor = gate.get("min_expectancy_pct", 0.0)
         if est_cost is not None:
             exp_floor = max(exp_floor, est_cost + gate.get("cost_margin_bps", 0.0) / 100.0)
@@ -253,6 +264,11 @@ def realign_eligibility(conn: sqlite3.Connection, gate: dict) -> int:
             or (lev is not None and lev >= gate["avg_leverage"])
             or (shp is not None and shp <= gate["min_sharpe"])
             or (exp is not None and exp < exp_floor)
+            or (bal is not None and bal < gate.get("min_balance_usd", 0.0))
+            or (rpnl is not None and rpnl < gate.get("min_realized_pnl_usd", 0.0))
+            or (dsl is not None and dsl > gate.get("max_days_since_trade", 1e9))
+            or (dom is not None and dom > gate.get("max_single_trade_dominance", 1.0))
+            or (eqq is not None and eqq < gate.get("min_equity_curve_quality", 0.0))
         )
         if fails:
             demote.append((r["address"],))
@@ -268,3 +284,28 @@ def stats(conn: sqlite3.Connection) -> dict:
     e = conn.execute("SELECT COUNT(*) n FROM wallet_scores WHERE eligible=1 AND banned=0").fetchone()["n"]
     b = conn.execute("SELECT COUNT(*) n FROM wallet_scores WHERE banned=1").fetchone()["n"]
     return {"discovered": d, "scored": s, "eligible": e, "banned": b}
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+    conn.commit()
+
+
+def get_meta(conn: sqlite3.Connection, key: str, default=None):
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+        r = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else default
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def reset_audit_clock(conn: sqlite3.Connection) -> int:
+    """Set audited_at=0 for every discovered wallet so the rotation re-audits the WHOLE
+    universe under the current rules (leaderboard-first, as in normal discovery). Keeps all
+    discovered addresses and existing scores; only the audit recency is reset."""
+    cur = conn.execute("UPDATE discovered_addresses SET audited_at=0")
+    conn.commit()
+    return cur.rowcount

@@ -48,13 +48,20 @@ assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-9, "Safety Score weights must sum t
 # Auto-pass thresholds (a wallet must clear ALL to be basket-eligible)
 AUTO_PASS = {
     "max_single_trade_loss_pct": 10.0,
-    "max_drawdown_pct": 25.0,
+    "max_drawdown_pct": 25.0,            # KEPT strict (the proposed 40-60% loosening was rejected)
     "avg_leverage": 10.0,
     "min_sharpe": 1.5,
-    "min_trades": 30,            # COPY gate: scored at 15, but only copied with a real sample
-    "min_history_days": 30,      # COPY gate: 30 days of live history before capital follows
-    "min_expectancy_pct": 0.1,   # COPY gate floor: avg round-trip must clear ~0.1%
-    "cost_margin_bps": 5.0,      # ...and must additionally beat OUR estimated cost to copy the wallet by this margin (cost-aware gate)
+    "min_trades": 30,                    # COPY gate: scored at 15, copied only with a real sample
+    "min_history_days": 60,              # COPY gate: raised 30 -> 60 days (proposed-rules merge)
+    "min_expectancy_pct": 0.1,           # COPY gate floor: avg round-trip must clear ~0.1%
+    "cost_margin_bps": 5.0,              # ...and must beat OUR estimated copy cost by this margin (cost-aware gate)
+    # --- proposed-rules merge: size / recency / not-one-lucky-trade. A check is SKIPPED when its value is unknown. ---
+    "min_balance_usd": 5000.0,           # skin in the game (applied only when the account could be measured)
+    "min_realized_pnl_usd": 10000.0,     # proven historical profit over the window
+    "max_days_since_trade": 7.0,         # must be currently active
+    "max_single_trade_dominance": 0.50,  # reject if one trade is >50% of gross profit (lucky-gambler guard)
+    "min_equity_curve_quality": 0.45,    # basket wallet must show a healthy, steady, upward curve (0..1; tunable). Captures "steady upward equity" WITHOUT a win-rate floor.
+    # NOTE: a win-rate floor was deliberately NOT added -- our own data shows the bleeders are 80-97% win rate.
 }
 
 # Auto-ban triggers (ANY one bans the wallet regardless of weighted score)
@@ -66,9 +73,11 @@ AUTO_BAN = {
 
 # Empirical-Bayes shrinkage: small samples get pulled toward the population mean.
 # effective_score = (n/(n+K))*raw + (K/(n+K))*prior_mean
-BUILD_VERSION = "2026-06-04-stream-k25-gate-reset-guards"  # bump on each shipped build so /health proves what is actually running
+BUILD_VERSION = "2026-06-05-eqcurve-quality-gate"  # bump on each shipped build so /health proves what is actually running
 LIVE_BREAKER_LOSS_PCT = 2.0   # live circuit breaker: suspend a basket wallet once its copied P&L falls below -2% of its allotted slice
 LIVE_BREAKER_MIN_TRADES = 5   # ...but only after this many live trades, so one unlucky trade cannot trip it
+GLOBAL_KILL_DRAWDOWN_PCT = 15.0  # portfolio kill switch: halt ALL copying + close everything if equity falls 15% from start
+TARGET_WALLET_DD_PCT = 50.0      # stop copying a wallet whose OWN account falls >50% from its peak while we follow it
 SHRINKAGE_K = 25              # was 60; the walk-forward showed the RAW score separates survivors at predictive grade while the heavily-shrunk score did not — 60 was over-compressing real signal. The 30-trade/30-day COPY gate independently protects the basket from thin samples, so a lighter K is safe.
 PRIOR_MEAN = 50.0            # neutral prior on the 0-100 scale
 
@@ -112,9 +121,9 @@ PORTFOLIO = {
     "basket_size": 25,            # top-N eligible wallets to mirror
     "weighting": "safety_score",  # equal | safety_score | inverse_vol
     "max_weight_per_trader": 0.10,
-    "max_weight_per_asset": 0.25,
+    "max_weight_per_asset": 0.15,   # tightened 0.25->0.15: cap any single COIN's share of the book (HYPE-pileup fix), enforced live
     "max_portfolio_leverage": 3.0,
-    "own_stop_loss_pct": 12.0,    # OUR discipline overlay, independent of the trader
+    "own_stop_loss_pct": 5.0,     # hardcoded 5% paper stop (was 12%); tighter -> more stop-outs, measured vs 12%
     "capacity_test_sizes": [10_000, 100_000, 1_000_000],
 }
 

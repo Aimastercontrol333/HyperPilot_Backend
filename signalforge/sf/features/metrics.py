@@ -13,6 +13,8 @@ clearinghouse leverage. It's an approximation and flagged as such.
 """
 from __future__ import annotations
 
+import time
+
 import math
 import statistics as stats
 from dataclasses import dataclass, field
@@ -124,6 +126,11 @@ class WalletMetrics:
     cum_return_pct: float
     archetype: str
     est_follower_cost_pct: float = 0.0   # our estimated cost to COPY this wallet (its coin mix), per round-trip %
+    account_value_usd: float | None = None   # current account equity (None if it could not be fetched)
+    realized_pnl_usd: float = 0.0            # summed realized PnL (USD) over the window
+    days_since_last_trade: float | None = None
+    single_trade_dominance: float = 0.0      # max single win / gross profit (one trade carrying the record -> ~1.0)
+    equity_curve_quality: float = 0.0        # 0..1 shape of the curve: steady, upward, making new highs
     extra: dict = field(default_factory=dict)
 
 
@@ -141,6 +148,33 @@ def _max_drawdown(eq: list[float]) -> float:
         peak = max(peak, v)
         mdd = max(mdd, peak - v)
     return mdd
+
+
+def _equity_curve_quality(eq: list[float]) -> float:
+    """0..1 score of a 'healthy, steady upward' equity curve, from the cumulative
+    per-trade return path. Combines LINEARITY (R^2 of equity vs time -> how straight
+    the climb is, penalizing chop) with NEW-HIGH PARTICIPATION (fraction of points
+    strictly above all prior -> how much time it spends making new highs, penalizing
+    deep dips and flat-then-one-spike curves). A flat or net-declining curve scores 0.
+    This captures the SHAPE of the curve, which the depth-only drawdown factor and the
+    per-trade consistency factor don't directly see."""
+    n = len(eq)
+    if n < 5 or eq[-1] <= 0:          # too short, or not net-upward
+        return 0.0
+    xs = list(range(n))
+    mx = sum(xs) / n
+    my = sum(eq) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in eq)
+    sxy = sum((xs[i] - mx) * (eq[i] - my) for i in range(n))
+    r2 = (sxy * sxy) / (sxx * syy) if sxx > 0 and syy > 0 else 0.0
+    nh, run = 0, float("-inf")
+    for v in eq:
+        if v > run:
+            nh += 1
+            run = v
+    new_high_frac = nh / n
+    return max(0.0, min(1.0, 0.5 * r2 + 0.5 * new_high_frac))
 
 
 def _classify(direction_mix: float, avg_hold_h: float, freq_per_day: float,
@@ -338,6 +372,14 @@ def compute_metrics(address: str, trips: list[RoundTrip],
     elif too_fast:
         archetype = "Latency Scalper"
 
+    # --- proposed-rules-merge metrics ---
+    realized_pnl_usd = sum(t.closed_pnl for t in trips)
+    pos_pnls = [t.closed_pnl for t in trips if t.closed_pnl > 0]
+    gross_profit = sum(pos_pnls)
+    single_dom = (max(pos_pnls) / gross_profit) if gross_profit > 0 else 0.0
+    days_since = max(0.0, (int(time.time() * 1000) - trips[-1].close_ms) / 86_400_000.0)
+    equity_curve_quality = _equity_curve_quality(eq)
+
     return WalletMetrics(
         address=address, n_trades=n, history_days=span_days, win_rate=win_rate,
         avg_ret_pct=avg_ret, expectancy_pct=avg_ret, max_single_loss_pct=max_single_loss,
@@ -347,6 +389,9 @@ def compute_metrics(address: str, trips: list[RoundTrip],
         martingale_score=martingale, liquidations=liquidations,
         cum_return_pct=eq[-1] if eq else 0.0, archetype=archetype,
         est_follower_cost_pct=_est_follower_cost_pct(trips),
+        account_value_usd=account_value, realized_pnl_usd=realized_pnl_usd,
+        days_since_last_trade=days_since, single_trade_dominance=single_dom,
+        equity_curve_quality=equity_curve_quality,
         extra={"avg_hold_h": avg_hold_h, "freq_per_day": freq_per_day,
                "leverage_is_proxy": not lev_known, "leverage_known": lev_known,
                "maker_ratio": maker_ratio, "fanout": fanout, "is_market_maker": is_mm,

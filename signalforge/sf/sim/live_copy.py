@@ -80,6 +80,7 @@ class PaperPortfolio:
     _equity: float = 0.0
     _last_eq_ms: int = 0
     reset_token: str = ""
+    halted: bool = False           # global kill switch engaged (closed all, no new copies)
 
     def __post_init__(self):
         self._equity = self.start_equity
@@ -116,11 +117,19 @@ class PaperPortfolio:
             self._open(trader, coin, "long" if new > 0 else "short", mark_px, ts)
 
     def _open(self, trader, coin, side, mark_px, ts):
+        if self.halted:                     # global kill switch engaged: no new copies
+            return
         if trader in self.suspended:        # circuit breaker: no new copies from a cut wallet
             return
         weight = self.weights.get(trader, 0.0)
         notional = self._equity * min(weight, C.PORTFOLIO["max_weight_per_trader"])
         if notional <= 0:
+            return
+        # per-COIN exposure cap: don't let many wallets pile the whole book into one coin
+        cap_asset = C.PORTFOLIO.get("max_weight_per_asset", 1.0)
+        coin_open = sum(p.notional for p in self.open_positions.values() if p.coin == coin)
+        notional = min(notional, max(0.0, cap_asset * self._equity - coin_open))
+        if notional <= 1.0:                 # this coin is already at its cap -> skip
             return
         costs = fm.estimate_costs(coin, notional, None, self.spread_bps.get(coin))
         entry = fm.apply_entry(mark_px, side, costs)
@@ -185,6 +194,16 @@ class PaperPortfolio:
                 continue
             unreal += pos.notional * net_pct / 100.0
         self._equity = self.start_equity + self.realized_pnl + unreal
+        # GLOBAL KILL SWITCH: whole book down > threshold from start -> close everything, halt new copies
+        if not self.halted and self._equity <= self.start_equity * (1 - C.GLOBAL_KILL_DRAWDOWN_PCT / 100.0):
+            self.halted = True
+            print(f"[livecopy] GLOBAL KILL SWITCH: equity {self._equity:.0f} <= "
+                  f"-{C.GLOBAL_KILL_DRAWDOWN_PCT}% of start; closing all positions + halting new copies")
+            for key in list(self.open_positions):
+                mk = mids.get(self.open_positions[key].coin)
+                if mk:
+                    self._close(key, mk, now_ms, reason="global_kill")
+            self._equity = self.start_equity + self.realized_pnl
         # record an equity point at most every 2 minutes (cap series length)
         if now_ms - self._last_eq_ms >= 120_000:
             self.equity_history.append((now_ms, round(self._equity, 2)))
@@ -227,6 +246,7 @@ class PaperPortfolio:
             "win_rate": round(len(wins) / len(self.closed), 3) if self.closed else 0.0,
             "recent_closed": list(reversed(self.closed[-30:])),
             "equity_curve": self.equity_history,
+            "halted": self.halted,
             "suspended": sorted(t[:6] + "…" + t[-4:] for t in self.suspended),
             "per_trader": {k: {"pnl": round(v["pnl"], 2), "trades": v["trades"],
                                "win_rate": round(v["wins"] / v["trades"], 2) if v["trades"] else 0}
@@ -239,7 +259,8 @@ class PaperPortfolio:
         return {"start_equity": self.start_equity, "realized_pnl": self.realized_pnl,
                 "equity_history": self.equity_history, "day_start_equity": self.day_start_equity, "reset_token": self.reset_token,
                 "day_start_ms": self.day_start_ms, "closed": self.closed[-200:],
-                "per_trader": self.per_trader, "suspended": list(self.suspended), "trader_pnl_full": self.trader_pnl_full}
+                "per_trader": self.per_trader, "suspended": list(self.suspended), "trader_pnl_full": self.trader_pnl_full,
+                "halted": self.halted}
 
     @classmethod
     def from_state(cls, state: dict, weights: dict, own_stop_pct: float) -> "PaperPortfolio":
@@ -257,6 +278,7 @@ class PaperPortfolio:
         pf.per_trader = state.get("per_trader", {})
         pf.suspended = set(state.get("suspended", []))
         pf.trader_pnl_full = state.get("trader_pnl_full", {})
+        pf.halted = bool(state.get("halted", False))
         pf._equity = pf.start_equity + pf.realized_pnl
         return pf
 
@@ -266,11 +288,14 @@ class LiveCopyEngine:
 
     def __init__(self, basket: list[tuple[str, float]], ws_url: str = C.HL_WS,
                  start_equity: float = C.PORTFOLIO["start_equity_usd"],
-                 state_path: str | None = None):
+                 state_path: str | None = None, own_stop: float | None = None,
+                 label: str = "A"):
         self.basket = basket
         self.ws_url = ws_url
         self.weights = dict(basket)
         self.state_path = state_path
+        self.label = label
+        own_stop_pct = own_stop if own_stop is not None else C.PORTFOLIO["own_stop_loss_pct"]
         reset_token = os.environ.get("SF_RESET_LIVE", "")
         prior = None
         if state_path and os.path.exists(state_path):
@@ -281,16 +306,17 @@ class LiveCopyEngine:
                 prior = None
         do_reset = bool(prior) and (str(prior.get("reset_token", "")) != str(reset_token))
         if prior and not do_reset:
-            self.pf = PaperPortfolio.from_state(prior, self.weights, C.PORTFOLIO["own_stop_loss_pct"])
-            print(f"[livecopy] resumed from saved state (equity={self.pf._equity:.0f}, "
-                  f"{len(self.pf.equity_history)} curve points)")
+            self.pf = PaperPortfolio.from_state(prior, self.weights, own_stop_pct)
+            print(f"[livecopy:{label}] resumed from saved state (equity={self.pf._equity:.0f}, "
+                  f"{len(self.pf.equity_history)} curve points, stop={own_stop_pct:.0f}%)")
         else:
             if do_reset:
-                print(f"[livecopy] RESET requested (SF_RESET_LIVE '{prior.get('reset_token','')}'"
+                print(f"[livecopy:{label}] RESET requested (SF_RESET_LIVE '{prior.get('reset_token','')}'"
                       f"->'{reset_token}'): fresh paper account at ${start_equity:,.0f}, prior trades cleared")
-            self.pf = PaperPortfolio(start_equity=start_equity, weights=self.weights)
+            self.pf = PaperPortfolio(start_equity=start_equity, weights=self.weights, own_stop_pct=own_stop_pct)
         self.pf.reset_token = reset_token
         self.mids: dict[str, float] = {}
+        self._trader_hw: dict[str, float] = {}   # target-wallet equity high-water (drives the DD breaker)
         self._lock = threading.Lock()
         self._ws = None
         self._basket_provider = None
@@ -335,6 +361,24 @@ class LiveCopyEngine:
                             self.pf.funding_hr[coin] = sum(rates) / len(rates)
                     except Exception:  # noqa: BLE001
                         pass
+                # target-wallet drawdown breaker: stop copying a wallet whose OWN account
+                # has fallen more than TARGET_WALLET_DD_PCT from its peak since we started watching
+                dd_pct = getattr(C, "TARGET_WALLET_DD_PCT", 50.0)
+                for addr in list(self.weights):
+                    try:
+                        st = self.client.clearinghouse_state(addr) or {}
+                        av = float((st.get("marginSummary") or {}).get("accountValue") or 0)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if av <= 0:
+                        continue
+                    hw = self._trader_hw.get(addr, 0.0)
+                    if av > hw:
+                        self._trader_hw[addr] = av; hw = av
+                    if hw > 0 and av <= hw * (1 - dd_pct / 100.0) and addr not in self.pf.suspended:
+                        self.pf.suspended.add(addr)
+                        print(f"[livecopy] TARGET-DD breaker: {addr[:6]}… account ${av:.0f} "
+                              f"down >{dd_pct}% from peak ${hw:.0f}; suspending copies")
             except Exception:  # noqa: BLE001
                 pass
             time.sleep(every_s)

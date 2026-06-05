@@ -271,6 +271,21 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # Optional: SF_REAUDIT=<any new value> forces a full re-audit of the whole universe under
+    # the current rules (leaderboard-first), idempotently (only fires when the value changes).
+    reaudit = os.environ.get("SF_REAUDIT", "").strip()
+    if reaudit:
+        try:
+            with store.session(DB_PATH) as conn:
+                if store.get_meta(conn, "reaudit_token") != reaudit:
+                    cnt = store.reset_audit_clock(conn)
+                    store.set_meta(conn, "reaudit_token", reaudit)
+                    print(f"[startup] SF_REAUDIT='{reaudit}': reset audit clock on {cnt} wallets -> "
+                          f"full re-audit, leaderboard first")
+                else:
+                    print(f"[startup] SF_REAUDIT='{reaudit}' already applied; skipping re-audit reset")
+        except Exception as e:  # noqa: BLE001
+            print(f"[startup] re-audit reset skipped: {e}")
     try:
         with store.session(DB_PATH) as conn:
             n = store.realign_eligibility(conn, C.AUTO_PASS)

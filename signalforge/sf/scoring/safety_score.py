@@ -115,6 +115,11 @@ def _auto_ban(m: WalletMetrics) -> list[str]:
 
 def _auto_pass(m: WalletMetrics) -> bool:
     ap = C.AUTO_PASS
+    bal = getattr(m, "account_value_usd", None)
+    rpnl = getattr(m, "realized_pnl_usd", None)
+    dsl = getattr(m, "days_since_last_trade", None)
+    dom = getattr(m, "single_trade_dominance", None)
+    eqq = getattr(m, "equity_curve_quality", None)
     return (
         m.n_trades >= ap["min_trades"]
         and m.max_single_loss_pct < ap["max_single_trade_loss_pct"]
@@ -124,6 +129,12 @@ def _auto_pass(m: WalletMetrics) -> bool:
         and m.sharpe > ap["min_sharpe"]
         and m.history_days >= ap["min_history_days"]
         and m.expectancy_pct >= _expectancy_gate(m)
+        # --- proposed-rules merge (a check is skipped when its value is unknown) ---
+        and (bal is None or bal >= ap.get("min_balance_usd", 0.0))
+        and (rpnl is None or rpnl >= ap.get("min_realized_pnl_usd", 0.0))
+        and (dsl is None or dsl <= ap.get("max_days_since_trade", 1e9))
+        and (dom is None or dom <= ap.get("max_single_trade_dominance", 1.0))
+        and (eqq is None or eqq >= ap.get("min_equity_curve_quality", 0.0))
     )
 
 
