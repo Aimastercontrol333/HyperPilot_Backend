@@ -145,7 +145,8 @@ def upsert_score(conn: sqlite3.Connection, sr) -> None:
                      "realized_pnl_usd": (m.realized_pnl_usd if m else None),
                      "days_since_last_trade": (m.days_since_last_trade if m else None),
                      "single_trade_dominance": (m.single_trade_dominance if m else None),
-                     "equity_curve_quality": (m.equity_curve_quality if m else None)})),
+                     "equity_curve_quality": (m.equity_curve_quality if m else None),
+                     "equity_curve": (m.equity_curve if m else None)})),
     )
     conn.commit()
 
@@ -181,6 +182,7 @@ def all_scores(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
             "realized_pnl_usd": round(d["realized_pnl_usd"]) if d.get("realized_pnl_usd") is not None else None,
             "days_since_last_trade": round(d["days_since_last_trade"], 1) if d.get("days_since_last_trade") is not None else None,
             "equity_curve_quality": round(d["equity_curve_quality"], 2) if d.get("equity_curve_quality") is not None else None,
+            "equity_curve": d.get("equity_curve") or None,
         })
     return out
 

@@ -75,6 +75,8 @@ class PaperPortfolio:
     day_start_equity: float = 0.0
     day_start_ms: int = 0
     equity_history: list = field(default_factory=list)   # [(ms, equity), ...]
+    inception_ms: int = 0                                 # when this (reset) account started
+    daily_end: dict = field(default_factory=dict)         # "YYYY-MM-DD" (UTC) -> equity at last update that day
     spread_bps: dict = field(default_factory=dict)        # coin -> measured half-spread (bps), set by engine
     funding_hr: dict = field(default_factory=dict)        # coin -> recent avg funding (bps/hour), set by engine
     _equity: float = 0.0
@@ -88,6 +90,24 @@ class PaperPortfolio:
         self.day_start_ms = int(time.time() * 1000)
         self.equity_history = [(self.day_start_ms, round(self.start_equity, 2))]
         self._last_eq_ms = self.day_start_ms
+        self.inception_ms = self.day_start_ms
+        self.daily_end = {self._utc_date(self.day_start_ms): round(self.start_equity, 2)}
+
+    @staticmethod
+    def _utc_date(ms: int) -> str:
+        return time.strftime("%Y-%m-%d", time.gmtime(ms / 1000.0))
+
+    def _daily_record(self) -> list:
+        """One row per UTC day since inception: end-of-day equity and that day's P&L.
+        P&L is the change in account equity over the day (includes open-position
+        mark-to-market), measured vs the prior day close (day 1 vs the start)."""
+        out, prev = [], self.start_equity
+        for date, eq in sorted(self.daily_end.items()):
+            out.append({"date": date, "equity_end": round(eq, 2),
+                        "pnl_usd": round(eq - prev, 2),
+                        "pnl_pct": round((eq / prev - 1) * 100, 2) if prev else 0.0})
+            prev = eq
+        return out
 
     # -- event in: a basket wallet's fill ------------------------------------
     def on_fill(self, trader: str, coin: str, dir_str: str, sz: float,
@@ -209,6 +229,7 @@ class PaperPortfolio:
             self.equity_history.append((now_ms, round(self._equity, 2)))
             self.equity_history = self.equity_history[-240:]
             self._last_eq_ms = now_ms
+            self.daily_end[self._utc_date(now_ms)] = round(self._equity, 2)
         # daily reset
         if now_ms - self.day_start_ms > 86_400_000:
             self.day_start_equity = self._equity
@@ -246,6 +267,9 @@ class PaperPortfolio:
             "win_rate": round(len(wins) / len(self.closed), 3) if self.closed else 0.0,
             "recent_closed": list(reversed(self.closed[-30:])),
             "equity_curve": self.equity_history,
+            "days_live": len(self.daily_end),
+            "since_ms": self.inception_ms,
+            "daily": self._daily_record(),
             "halted": self.halted,
             "suspended": sorted(t[:6] + "…" + t[-4:] for t in self.suspended),
             "per_trader": {k: {"pnl": round(v["pnl"], 2), "trades": v["trades"],
@@ -258,7 +282,8 @@ class PaperPortfolio:
     def to_state(self) -> dict:
         return {"start_equity": self.start_equity, "realized_pnl": self.realized_pnl,
                 "equity_history": self.equity_history, "day_start_equity": self.day_start_equity, "reset_token": self.reset_token,
-                "day_start_ms": self.day_start_ms, "closed": self.closed[-200:],
+                "day_start_ms": self.day_start_ms, "inception_ms": self.inception_ms,
+                "daily_end": self.daily_end, "closed": self.closed[-200:],
                 "per_trader": self.per_trader, "suspended": list(self.suspended), "trader_pnl_full": self.trader_pnl_full,
                 "halted": self.halted}
 
@@ -274,6 +299,10 @@ class PaperPortfolio:
         pf.day_start_equity = state.get("day_start_equity", pf.day_start_equity)
         pf.reset_token = state.get("reset_token", "")
         pf.day_start_ms = state.get("day_start_ms", pf.day_start_ms)
+        pf.inception_ms = state.get("inception_ms", pf.inception_ms)
+        de = state.get("daily_end")
+        if de:
+            pf.daily_end = {str(k): float(v) for k, v in de.items()}
         pf.closed = state.get("closed", [])
         pf.per_trader = state.get("per_trader", {})
         pf.suspended = set(state.get("suspended", []))

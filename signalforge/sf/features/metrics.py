@@ -131,6 +131,7 @@ class WalletMetrics:
     days_since_last_trade: float | None = None
     single_trade_dominance: float = 0.0      # max single win / gross profit (one trade carrying the record -> ~1.0)
     equity_curve_quality: float = 0.0        # 0..1 shape of the curve: steady, upward, making new highs
+    equity_curve: list = field(default_factory=list)  # downsampled cumulative-return path for the UI drawer
     extra: dict = field(default_factory=dict)
 
 
@@ -175,6 +176,20 @@ def _equity_curve_quality(eq: list[float]) -> float:
             run = v
     new_high_frac = nh / n
     return max(0.0, min(1.0, 0.5 * r2 + 0.5 * new_high_frac))
+
+
+def _downsample(eq: list[float], target: int = 40) -> list[float]:
+    """Compact the cumulative-return curve to <= `target` points for the UI feed,
+    keeping the first and last point and evenly sampling between. Rounded to 3 dp."""
+    n = len(eq)
+    if n == 0:
+        return []
+    if n <= target:
+        return [round(v, 3) for v in eq]
+    step = (n - 1) / (target - 1)
+    out = [round(eq[min(int(round(i * step)), n - 1)], 3) for i in range(target)]
+    out[-1] = round(eq[-1], 3)
+    return out
 
 
 def _classify(direction_mix: float, avg_hold_h: float, freq_per_day: float,
@@ -379,6 +394,7 @@ def compute_metrics(address: str, trips: list[RoundTrip],
     single_dom = (max(pos_pnls) / gross_profit) if gross_profit > 0 else 0.0
     days_since = max(0.0, (int(time.time() * 1000) - trips[-1].close_ms) / 86_400_000.0)
     equity_curve_quality = _equity_curve_quality(eq)
+    equity_curve_ds = _downsample(eq, 40)
 
     return WalletMetrics(
         address=address, n_trades=n, history_days=span_days, win_rate=win_rate,
@@ -392,6 +408,7 @@ def compute_metrics(address: str, trips: list[RoundTrip],
         account_value_usd=account_value, realized_pnl_usd=realized_pnl_usd,
         days_since_last_trade=days_since, single_trade_dominance=single_dom,
         equity_curve_quality=equity_curve_quality,
+        equity_curve=equity_curve_ds,
         extra={"avg_hold_h": avg_hold_h, "freq_per_day": freq_per_day,
                "leverage_is_proxy": not lev_known, "leverage_known": lev_known,
                "maker_ratio": maker_ratio, "fanout": fanout, "is_market_maker": is_mm,

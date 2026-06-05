@@ -73,7 +73,7 @@ AUTO_BAN = {
 
 # Empirical-Bayes shrinkage: small samples get pulled toward the population mean.
 # effective_score = (n/(n+K))*raw + (K/(n+K))*prior_mean
-BUILD_VERSION = "2026-06-05-eqcurve-quality-gate"  # bump on each shipped build so /health proves what is actually running
+BUILD_VERSION = "2026-06-05-daily-track-record"  # bump on each shipped build so /health proves what is actually running
 LIVE_BREAKER_LOSS_PCT = 2.0   # live circuit breaker: suspend a basket wallet once its copied P&L falls below -2% of its allotted slice
 LIVE_BREAKER_MIN_TRADES = 5   # ...but only after this many live trades, so one unlucky trade cannot trip it
 GLOBAL_KILL_DRAWDOWN_PCT = 15.0  # portfolio kill switch: halt ALL copying + close everything if equity falls 15% from start
