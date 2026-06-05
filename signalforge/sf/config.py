@@ -73,7 +73,7 @@ AUTO_BAN = {
 
 # Empirical-Bayes shrinkage: small samples get pulled toward the population mean.
 # effective_score = (n/(n+K))*raw + (K/(n+K))*prior_mean
-BUILD_VERSION = "2026-06-05-daily-track-record"  # bump on each shipped build so /health proves what is actually running
+BUILD_VERSION = "2026-06-05-take-profit-15"  # bump on each shipped build so /health proves what is actually running
 LIVE_BREAKER_LOSS_PCT = 2.0   # live circuit breaker: suspend a basket wallet once its copied P&L falls below -2% of its allotted slice
 LIVE_BREAKER_MIN_TRADES = 5   # ...but only after this many live trades, so one unlucky trade cannot trip it
 GLOBAL_KILL_DRAWDOWN_PCT = 15.0  # portfolio kill switch: halt ALL copying + close everything if equity falls 15% from start
@@ -124,6 +124,7 @@ PORTFOLIO = {
     "max_weight_per_asset": 0.15,   # tightened 0.25->0.15: cap any single COIN's share of the book (HYPE-pileup fix), enforced live
     "max_portfolio_leverage": 3.0,
     "own_stop_loss_pct": 5.0,     # hardcoded 5% paper stop (was 12%); tighter -> more stop-outs, measured vs 12%
+    "take_profit_pct": 15.0,      # take-profit: close a copied position once net gain >= 15% (caps upside, locks gains; tunable)
     "capacity_test_sizes": [10_000, 100_000, 1_000_000],
 }
 

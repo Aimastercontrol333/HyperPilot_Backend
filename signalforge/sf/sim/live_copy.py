@@ -65,6 +65,7 @@ class PaperPortfolio:
     start_equity: float
     weights: dict[str, float]                      # address -> weight (sum<=1)
     own_stop_pct: float = C.PORTFOLIO["own_stop_loss_pct"]
+    take_profit_pct: float = C.PORTFOLIO["take_profit_pct"]
     realized_pnl: float = 0.0
     open_positions: dict[tuple, PaperPosition] = field(default_factory=dict)
     trader_net: dict[tuple, float] = field(default_factory=dict)
@@ -212,6 +213,9 @@ class PaperPortfolio:
             if net_pct <= -self.own_stop_pct:
                 self._close(key, mark, now_ms, reason="our_stop", forced_ret_pct=-self.own_stop_pct)
                 continue
+            if self.take_profit_pct and net_pct >= self.take_profit_pct:
+                self._close(key, mark, now_ms, reason="take_profit", forced_ret_pct=self.take_profit_pct)
+                continue
             unreal += pos.notional * net_pct / 100.0
         self._equity = self.start_equity + self.realized_pnl + unreal
         # GLOBAL KILL SWITCH: whole book down > threshold from start -> close everything, halt new copies
@@ -251,6 +255,7 @@ class PaperPortfolio:
                 "unreal_pct": round(unreal_pct, 2),
                 "age_h": round((now - pos.open_ms) / 3.6e6, 1),
                 "notional": round(pos.notional, 2),
+                "unreal_usd": round(pos.notional * unreal_pct / 100.0, 2),
             })
         wins = [c for c in self.closed if c["net_ret_pct"] > 0]
         return {
@@ -265,7 +270,9 @@ class PaperPortfolio:
             "open_count": len(open_list),
             "closed_count": len(self.closed),
             "win_rate": round(len(wins) / len(self.closed), 3) if self.closed else 0.0,
-            "recent_closed": list(reversed(self.closed[-30:])),
+            "realized_pnl_usd": round(self.realized_pnl, 2),
+            "unrealized_pnl_usd": round(self._equity - self.start_equity - self.realized_pnl, 2),
+            "recent_closed": list(reversed(self.closed[-120:])),
             "equity_curve": self.equity_history,
             "days_live": len(self.daily_end),
             "since_ms": self.inception_ms,
