@@ -81,8 +81,14 @@ class HyperliquidClient:
         """Universe of perps + per-asset context (mark px, funding, oi)."""
         return self._post({"type": "metaAndAssetCtxs"})
 
-    def all_mids(self) -> dict[str, str]:
-        return self._post({"type": "allMids"})
+    def all_mids(self, dex: str | None = None) -> dict[str, str]:
+        """Mid prices. With `dex`, queries a builder-deployed perp dex (e.g. "xyz")
+        whose coins (xyz:GOLD, ...) do NOT appear in the main allMids feed — this is
+        how the live engine prices them instead of leaving positions unmarkable."""
+        body: dict = {"type": "allMids"}
+        if dex:
+            body["dex"] = dex
+        return self._post(body)
 
     # -- discovery -----------------------------------------------------------
     def discover_universe(self, extra_seeds: list[str] | None = None,

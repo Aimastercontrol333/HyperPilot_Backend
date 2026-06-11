@@ -88,6 +88,135 @@ def build_report(addresses: list[str], lookback_days: int = 180,
     return report
 
 
+def build_report_multi(addresses: list[str], lookback_days: int = 240,
+                       holdout_days: int = 60, n_windows: int = 3,
+                       max_wallets: int = 300) -> dict:
+    """Multi-window walk-forward: the same test run over n_windows STAGGERED 60-day
+    holdouts (window 1 = the most recent 60d, window 2 = the 60d before that, ...).
+    One window can be flattered or damned by a single market regime; agreement
+    across independent windows is what makes the verdict publishable.
+
+    Each wallet's fills are pulled ONCE and every window is computed from the same
+    data, so this costs the same API budget as a single-window run. Top-level fields
+    mirror the single-window report (taken from the most recent window) so the
+    existing /walkforward.json consumers keep working; the per-window detail and the
+    cross-window consensus are added alongside.
+    """
+    client = HyperliquidClient()
+    now = int(time.time() * 1000)
+    # window i: train on everything before (now - (i+1)*h), test on the h-day slice after it
+    bounds = [(now - (i + 1) * holdout_days * DAY, now - i * holdout_days * DAY)
+              for i in range(n_windows)]
+    rows_by_win: list[list] = [[] for _ in range(n_windows)]
+    pulled = 0
+    for addr in addresses[:max_wallets]:
+        try:
+            fills, av = _pull(client, addr, lookback_days)
+        except Exception:  # noqa: BLE001
+            continue
+        if len(fills) < C.MIN_TRADES:
+            continue
+        pulled += 1
+        for i, (b, e) in enumerate(bounds):
+            r = row_for_wallet(fills, av, b, test_end_ms=e)
+            if r is not None:
+                rows_by_win[i].append(r)
+        del fills, av
+    windows = []
+    for i, rows in enumerate(rows_by_win):
+        a = _assemble(rows)
+        windows.append({
+            "window": i + 1,
+            "holdout_start_days_ago": (i + 1) * holdout_days,
+            "holdout_end_days_ago": i * holdout_days,
+            "wallets_analyzed": a["scored_wallets"] + a["banned_wallets"],
+            "scored_wallets": a["scored_wallets"],
+            "banned_wallets": a["banned_wallets"],
+            "ban_effectiveness": a["ban_effectiveness"],
+            "score_quintiles": a["score_quintiles"],
+            "survivability": a["survivability"],
+            "survivability_raw": a["survivability_raw"],
+            "predictive_dimension": a["predictive_dimension"],
+            "verdict": a["verdict"],
+            "_shrink_hint": a["_shrink_hint"],
+        })
+    # consensus across windows
+    verdicts = [w["verdict"] for w in windows]
+    usable = [w for w in windows if w["verdict"] != "insufficient_data"]
+    n_pred = sum(1 for w in usable if w["verdict"] == "predictive")
+    if not usable:
+        consensus = "insufficient_data"
+    elif n_pred == len(usable):
+        consensus = "predictive"
+    elif n_pred >= (len(usable) + 1) // 2:
+        consensus = "predictive_majority"
+    else:
+        consensus = "weak_or_none"
+    dims = [w["predictive_dimension"] for w in usable]
+    earns_every_window = bool(usable) and all(d == "both" for d in dims)
+
+    latest = windows[0] if windows else {}
+    report = {
+        "generated_at": int(time.time()),
+        "mode": "multi_window",
+        "n_windows": n_windows,
+        "holdout_days": holdout_days,
+        "lookback_days": lookback_days,
+        "wallets_pulled": pulled,
+        # top-level mirrors the MOST RECENT window for backwards compatibility
+        "wallets_analyzed": latest.get("wallets_analyzed", 0),
+        "scored_wallets": latest.get("scored_wallets", 0),
+        "banned_wallets": latest.get("banned_wallets", 0),
+        "ban_effectiveness": latest.get("ban_effectiveness", {}),
+        "score_quintiles": latest.get("score_quintiles", []),
+        "survivability": latest.get("survivability", {}),
+        "survivability_raw": latest.get("survivability_raw", {}),
+        "predictive_dimension": latest.get("predictive_dimension", "none"),
+        "windows": windows,
+        "consensus": {"verdict": consensus, "window_verdicts": verdicts,
+                      "predictive_windows": n_pred, "usable_windows": len(usable),
+                      "earns_in_every_window": earns_every_window},
+        "summary": {"verdict": consensus, **latest.get("survivability", {})},
+        "verdict": consensus,
+    }
+    report["plain_english"] = _plain_english_multi(report, holdout_days)
+    return report
+
+
+def _plain_english_multi(rep: dict, holdout_days: int) -> str:
+    cons = rep["consensus"]
+    wins = rep["windows"]
+    usable = [w for w in wins if w["verdict"] != "insufficient_data"]
+    parts: list[str] = []
+    if cons["verdict"] == "insufficient_data":
+        return ("Not enough copyable wallets in any holdout window yet to judge the score. "
+                "Keep the backend running and check back as more wallets are audited.")
+    parts.append(f"Tested across {len(usable)} independent {holdout_days}-day holdout windows: "
+                 f"{cons['predictive_windows']} of {len(usable)} came back PREDICTIVE on survivability "
+                 f"(higher score -> shallower forward drawdowns, fewer blow-ups).")
+    if cons["verdict"] == "predictive":
+        dd = [w["survivability"].get("dd_reduction_top_vs_bottom_pp", 0) for w in usable]
+        bl = [w["survivability"].get("blowup_reduction_top_vs_bottom_pp", 0) for w in usable]
+        parts.append(f"Top-vs-bottom drawdown reduction ranged {min(dd):+.1f} to {max(dd):+.1f}pt and "
+                     f"blow-up reduction {min(bl):+.0f} to {max(bl):+.0f}pp across windows — a consistent, "
+                     f"regime-independent risk signal. This is the publishable claim.")
+    elif cons["verdict"] == "predictive_majority":
+        parts.append("The signal held in most but not all windows — treat it as real but "
+                     "regime-sensitive; keep validating before leaning on it publicly.")
+    else:
+        parts.append("The signal did not hold across windows — what looked predictive in one period "
+                     "may have been that period's regime. Tune the weights before relying on it.")
+    if cons.get("earns_in_every_window"):
+        parts.append("The top tier ALSO out-earned the bottom tier in every window.")
+    else:
+        parts.append("Forward RETURNS were not consistently positive or consistently separated — "
+                     "treat the score as a risk filter, not a winner-picker, and don't market it as one.")
+    hints = {w.get("_shrink_hint", "") for w in wins if w.get("_shrink_hint")}
+    if hints:
+        parts.append(next(iter(hints)))
+    return " ".join(parts)
+
+
 def _plain_english(rep: dict, shrink_hint: str, holdout_days: int) -> str:
     n = rep["scored_wallets"]
     be = rep["ban_effectiveness"]

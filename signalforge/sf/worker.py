@@ -36,7 +36,7 @@ from . import pipeline
 from .ingest import store
 from .ingest.harvester import AddressHarvester
 from .sim.live_copy import LiveCopyEngine
-from .validation.report import build_report
+from .validation.report import build_report, build_report_multi
 from . import config as C
 
 DB_PATH = os.environ.get("SF_DB", store.DEFAULT_DB)
@@ -46,6 +46,7 @@ STATE_PATH = os.environ.get("SF_STATE", "live_state.json")
 WF_PATH = os.environ.get("SF_WF", "walkforward.json")
 WF_EVERY_HOURS = int(os.environ.get("WF_EVERY_HOURS", "24"))
 WF_MAX_WALLETS = int(os.environ.get("WF_MAX_WALLETS", "700"))  # how many top-scored wallets the daily walk-forward evaluates (was hard-coded 300; ~0.23 survive as non-banned scored, so 700 → ~150, comfortably past the 120 the verdict firms up at)
+WF_WINDOWS = int(os.environ.get("WF_WINDOWS", "3"))  # staggered holdout windows per run; one window can be flattered by one regime — consensus across windows is what makes the verdict publishable. Set 1 for the old single-window behavior.
 PORT = int(os.environ.get("PORT", "8080"))
 SCORE_EVERY_MIN = int(os.environ.get("SCORE_EVERY_MIN", "20"))
 MAX_WALLETS = int(os.environ.get("SF_MAX_WALLETS", "150"))
@@ -115,11 +116,16 @@ def _walkforward_thread():
                     if a not in addrs:
                         addrs.append(a)
             if addrs:
-                print(f"[worker] walk-forward starting on {len(addrs)} wallets...")
-                rep = build_report(addrs, max_wallets=WF_MAX_WALLETS)
+                print(f"[worker] walk-forward starting on {len(addrs)} wallets "
+                      f"({WF_WINDOWS} window(s))...")
+                if WF_WINDOWS > 1:
+                    rep = build_report_multi(addrs, n_windows=WF_WINDOWS,
+                                             max_wallets=WF_MAX_WALLETS)
+                else:
+                    rep = build_report(addrs, max_wallets=WF_MAX_WALLETS)
                 _atomic_write_json(WF_PATH, rep, indent=2)
                 print(f"[worker] walk-forward: {rep['verdict']} "
-                      f"({rep['wallets_analyzed']} wallets)")
+                      f"({rep.get('wallets_analyzed', 0)} wallets, latest window)")
         except Exception as e:  # noqa: BLE001
             print(f"[worker] walk-forward failed: {e}")
         time.sleep(WF_EVERY_HOURS * 3600)

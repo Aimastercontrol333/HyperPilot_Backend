@@ -35,9 +35,13 @@ class DecileResult:
     win_rate: float
 
 
-def _split_trips(trips: list[RoundTrip], boundary_ms: int):
+def _split_trips(trips: list[RoundTrip], boundary_ms: int, test_end_ms: int | None = None):
+    """train = trips closed by the boundary; test = trips opened after it.
+    test_end_ms bounds the forward window (multi-window walk-forward uses staggered
+    [boundary, boundary+holdout] slices so each window is judged on ITS OWN period)."""
     train = [t for t in trips if t.close_ms <= boundary_ms]
-    test = [t for t in trips if t.open_ms > boundary_ms]
+    test = [t for t in trips if t.open_ms > boundary_ms
+            and (test_end_ms is None or t.open_ms <= test_end_ms)]
     return train, test
 
 
@@ -312,12 +316,14 @@ def analyze(fills_by_wallet: dict[str, list[dict]], boundary_ms: int,
     return _assemble(rows)
 
 
-def row_for_wallet(fills: list[dict], av: list | None, boundary_ms: int) -> "_WFRow | None":
+def row_for_wallet(fills: list[dict], av: list | None, boundary_ms: int,
+                   test_end_ms: int | None = None) -> "_WFRow | None":
     """Compute one wallet's walk-forward row from its fills, then let the fills be
     garbage-collected. Streaming callers (build_report) use this so memory stays flat
-    regardless of how many wallets are evaluated."""
+    regardless of how many wallets are evaluated. test_end_ms bounds the forward
+    window for staggered multi-window runs."""
     trips = build_round_trips(fills)
-    train, test = _split_trips(trips, boundary_ms)
+    train, test = _split_trips(trips, boundary_ms, test_end_ms)
     if len(train) < C.MIN_TRADES or len(test) < MIN_TEST_TRADES:
         return None
     train_fills = [f for f in fills if int(f["time"]) <= boundary_ms]

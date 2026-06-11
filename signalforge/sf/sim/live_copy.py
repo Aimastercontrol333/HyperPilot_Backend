@@ -58,6 +58,7 @@ class PaperPosition:
     weight: float
     open_ms: int
     entry_cost_bps: float
+    stop_pct: float = 0.0   # per-position stop (vol-aware, set at open); 0 -> portfolio default
 
 
 @dataclass
@@ -80,6 +81,10 @@ class PaperPortfolio:
     daily_end: dict = field(default_factory=dict)         # "YYYY-MM-DD" (UTC) -> equity at last update that day
     spread_bps: dict = field(default_factory=dict)        # coin -> measured half-spread (bps), set by engine
     funding_hr: dict = field(default_factory=dict)        # coin -> recent avg funding (bps/hour), set by engine
+    daily_vol: dict = field(default_factory=dict)         # coin -> avg abs daily move (%), set by engine (drives vol-aware stop)
+    mark_ms: dict = field(default_factory=dict)           # coin -> ms of last FRESH mark (staleness guard)
+    suspended_at: dict = field(default_factory=dict)      # full addr -> ms when the breaker fired (drives auto-review)
+    _stale_info: dict = field(default_factory=dict)       # last mark-to-market staleness summary (for snapshot)
     _equity: float = 0.0
     _last_eq_ms: int = 0
     reset_token: str = ""
@@ -113,7 +118,13 @@ class PaperPortfolio:
     # -- event in: a basket wallet's fill ------------------------------------
     def on_fill(self, trader: str, coin: str, dir_str: str, sz: float,
                 mark_px: float, ts: int) -> None:
-        if trader not in self.weights or mark_px <= 0:
+        if mark_px <= 0:
+            return
+        # A trader removed from the basket must STILL have its closes mirrored for
+        # positions we already hold (the old `trader not in weights` guard silently
+        # dropped those fills, so de-listed wallets' positions could only exit via
+        # our stop/TP). New opens for de-listed traders are blocked in _open().
+        if trader not in self.weights and not any(k[0] == trader for k in self.open_positions):
             return
         key = (trader, coin)
         prev = self.trader_net.get(key, 0.0)
@@ -142,6 +153,16 @@ class PaperPortfolio:
             return
         if trader in self.suspended:        # circuit breaker: no new copies from a cut wallet
             return
+        # STALENESS GUARD: never open a position in a coin we cannot mark live.
+        # An unmarkable position is frozen capital with a stop that can never fire
+        # (the xyz:GOLD-at-entry-for-6-days failure mode).
+        if not getattr(C, "ALLOW_UNPRICED_OPENS", False):
+            last = self.mark_ms.get(coin, 0)
+            max_age_ms = getattr(C, "STALE_MARK_MAX_S", 900) * 1000
+            if not last or ts - last > max_age_ms:
+                print(f"[livecopy] SKIP open {coin} ({trader[:6]}…): no fresh live mark "
+                      f"(last {'never' if not last else f'{(ts - last) / 1000:.0f}s ago'}) — unpriced coins are not copied")
+                return
         weight = self.weights.get(trader, 0.0)
         notional = self._equity * min(weight, C.PORTFOLIO["max_weight_per_trader"])
         if notional <= 0:
@@ -152,11 +173,20 @@ class PaperPortfolio:
         notional = min(notional, max(0.0, cap_asset * self._equity - coin_open))
         if notional <= 1.0:                 # this coin is already at its cap -> skip
             return
+        # Volatility-aware stop: floor = own_stop_pct, scaled by the coin's average
+        # daily move, capped. A flat 5% on a coin that moves 5%/day is a coin-flip.
+        stop_pct = self.own_stop_pct
+        vol_mult = C.PORTFOLIO.get("stop_vol_mult", 0.0)
+        vol = self.daily_vol.get(coin)
+        if vol_mult and vol:
+            stop_pct = min(max(self.own_stop_pct, vol_mult * vol),
+                           C.PORTFOLIO.get("stop_cap_pct", 10.0))
         costs = fm.estimate_costs(coin, notional, None, self.spread_bps.get(coin))
         entry = fm.apply_entry(mark_px, side, costs)
         self.open_positions[(trader, coin)] = PaperPosition(
             trader=trader, coin=coin, side=side, entry_px=entry, notional=notional,
-            weight=weight, open_ms=ts, entry_cost_bps=costs.entry_cost_bps + costs.fee_bps)
+            weight=weight, open_ms=ts, entry_cost_bps=costs.entry_cost_bps + costs.fee_bps,
+            stop_pct=round(stop_pct, 2))
 
     def _close(self, key, mark_px, ts, reason: str, forced_ret_pct: float | None = None):
         pos = self.open_positions.pop(key, None)
@@ -186,6 +216,7 @@ class PaperPortfolio:
             slice_usd = self.weights.get(pos.trader, pos.weight) * self.start_equity
             if slice_usd > 0 and self.trader_pnl_full[pos.trader] <= -(C.LIVE_BREAKER_LOSS_PCT / 100.0) * slice_usd:
                 self.suspended.add(pos.trader)
+                self.suspended_at[pos.trader] = ts
                 print(f"[livecopy] CIRCUIT BREAKER: suspended {tkey} (live pnl "
                       f"{self.trader_pnl_full[pos.trader]:.0f} <= -{C.LIVE_BREAKER_LOSS_PCT}% of ${slice_usd:.0f} slice); no new copies")
         self.closed.append({
@@ -196,12 +227,28 @@ class PaperPortfolio:
         self.closed = self.closed[-500:]
 
     # -- periodic: mark to market + enforce our own stop ---------------------
-    def mark_to_market(self, mids: dict[str, float], now_ms: int) -> None:
+    def mark_to_market(self, mids: dict[str, float], now_ms: int,
+                       mid_ms: dict[str, int] | None = None) -> None:
+        """mid_ms (coin -> ms of last feed update) drives the staleness guard.
+        If omitted (unit tests / legacy callers), every supplied mid counts as fresh.
+        A STALE position (no fresh mark within STALE_MARK_MAX_S): its PnL is frozen
+        at the last trusted value of zero contribution, and its stop/TP are NOT
+        evaluated — we refuse to trade or value on prices we can't trust."""
+        max_age_ms = getattr(C, "STALE_MARK_MAX_S", 900) * 1000
+        # record which coins have a FRESH mark right now
+        for coin in mids:
+            ts = (mid_ms or {}).get(coin, now_ms)
+            if now_ms - ts <= max_age_ms:
+                self.mark_ms[coin] = ts
         unreal = 0.0
+        stale_notional, stale_coins = 0.0, set()
         for key, pos in list(self.open_positions.items()):
             mark = mids.get(pos.coin)
-            if not mark:
-                continue
+            fresh = mark and (now_ms - (mid_ms or {}).get(pos.coin, now_ms) <= max_age_ms)
+            if not fresh:
+                stale_notional += pos.notional
+                stale_coins.add(pos.coin)
+                continue  # no PnL, no stop, no TP on an untrusted price
             s = 1.0 if pos.side == "long" else -1.0
             gross_pct = s * (mark - pos.entry_px) / pos.entry_px * 100.0
             hold_h = max((now_ms - pos.open_ms) / 3.6e6, 0.0)
@@ -209,15 +256,30 @@ class PaperPortfolio:
             funding_pct = (fm.funding_cost_usd(pos.notional, pos.side, hold_h, fseries)
                            / pos.notional * 100.0) if pos.notional else 0.0
             net_pct = gross_pct - funding_pct
-            # OUR discipline overlay: independent stop, even if the trader holds
-            if net_pct <= -self.own_stop_pct:
-                self._close(key, mark, now_ms, reason="our_stop", forced_ret_pct=-self.own_stop_pct)
+            # OUR discipline overlay: independent per-position stop, even if the trader holds
+            stop = pos.stop_pct or self.own_stop_pct
+            if net_pct <= -stop:
+                self._close(key, mark, now_ms, reason="our_stop", forced_ret_pct=-stop)
                 continue
             if self.take_profit_pct and net_pct >= self.take_profit_pct:
                 self._close(key, mark, now_ms, reason="take_profit", forced_ret_pct=self.take_profit_pct)
                 continue
             unreal += pos.notional * net_pct / 100.0
+        self._stale_info = {"stale_notional_usd": round(stale_notional, 2),
+                            "stale_coins": sorted(stale_coins)}
         self._equity = self.start_equity + self.realized_pnl + unreal
+        # SUSPENSION AUTO-REVIEW: after SUSPENSION_REVIEW_DAYS, give a suspended wallet
+        # a fresh chance (breaker P&L counter resets to 0; the breaker can re-fire).
+        review_ms = getattr(C, "SUSPENSION_REVIEW_DAYS", 0) * 86_400_000
+        if review_ms:
+            for addr in list(self.suspended):
+                t0 = self.suspended_at.get(addr)
+                if t0 and now_ms - t0 >= review_ms:
+                    self.suspended.discard(addr)
+                    self.suspended_at.pop(addr, None)
+                    self.trader_pnl_full[addr] = 0.0
+                    print(f"[livecopy] SUSPENSION REVIEW: {addr[:6]}… reinstated after "
+                          f"{getattr(C, 'SUSPENSION_REVIEW_DAYS', 0):.0f}d; breaker counter reset")
         # GLOBAL KILL SWITCH: whole book down > threshold from start -> close everything, halt new copies
         if not self.halted and self._equity <= self.start_equity * (1 - C.GLOBAL_KILL_DRAWDOWN_PCT / 100.0):
             self.halted = True
@@ -240,26 +302,49 @@ class PaperPortfolio:
             self.day_start_ms = now_ms
 
     # -- live snapshot for the website ---------------------------------------
-    def snapshot(self, mids: dict[str, float] | None = None) -> dict:
+    def snapshot(self, mids: dict[str, float] | None = None,
+                 mid_ms: dict[str, int] | None = None) -> dict:
         mids = mids or {}
         now = int(time.time() * 1000)
+        max_age_ms = getattr(C, "STALE_MARK_MAX_S", 900) * 1000
         open_list = []
+        priced_unreal = 0.0
+        unpriced_notional = 0.0
+        stale_count = 0
         for pos in self.open_positions.values():
-            mark = mids.get(pos.coin, pos.entry_px)
-            s = 1.0 if pos.side == "long" else -1.0
-            unreal_pct = s * (mark - pos.entry_px) / pos.entry_px * 100.0
-            open_list.append({
+            mark = mids.get(pos.coin)
+            fresh = bool(mark) and (now - (mid_ms or {}).get(pos.coin, now) <= max_age_ms)
+            row = {
                 "coin": pos.coin, "side": pos.side,
                 "trader": pos.trader[:6] + "…" + pos.trader[-4:],
-                "entry": round(pos.entry_px, 4), "mark": round(mark, 4),
-                "unreal_pct": round(unreal_pct, 2),
+                "entry": round(pos.entry_px, 4),
                 "age_h": round((now - pos.open_ms) / 3.6e6, 1),
                 "notional": round(pos.notional, 2),
-                "unreal_usd": round(pos.notional * unreal_pct / 100.0, 2),
-            })
+                "stop_pct": pos.stop_pct or self.own_stop_pct,
+                "stale": not fresh,
+            }
+            if fresh:
+                s = 1.0 if pos.side == "long" else -1.0
+                unreal_pct = s * (mark - pos.entry_px) / pos.entry_px * 100.0
+                row.update({"mark": round(mark, 4), "unreal_pct": round(unreal_pct, 2),
+                            "unreal_usd": round(pos.notional * unreal_pct / 100.0, 2)})
+                priced_unreal += pos.notional * unreal_pct / 100.0
+            else:
+                # NO fake numbers: an unpriced position shows no mark and no PnL,
+                # and its notional is reported separately as unpriced exposure.
+                row.update({"mark": None, "unreal_pct": None, "unreal_usd": None})
+                unpriced_notional += pos.notional
+                stale_count += 1
+            open_list.append(row)
         wins = [c for c in self.closed if c["net_ret_pct"] > 0]
+        # global feed health: degraded if any open position is unpriced, or if the
+        # whole mids feed has gone quiet while we hold positions
+        feed_fresh = (not mid_ms) or (not self.open_positions) or any(
+            now - ts <= max_age_ms for ts in mid_ms.values())
+        quality = "ok" if (stale_count == 0 and feed_fresh) else "degraded"
         return {
             "status": "STREAMING",
+            "data_quality": quality,
             "equity": round(self._equity, 2),
             "start_equity": self.start_equity,
             "total_return_pct": round((self._equity / self.start_equity - 1) * 100, 2),
@@ -268,6 +353,8 @@ class PaperPortfolio:
                               if self.day_start_equity else 0.0,
             "open_positions": sorted(open_list, key=lambda x: -x["age_h"]),
             "open_count": len(open_list),
+            "unpriced_count": stale_count,
+            "unpriced_notional_usd": round(unpriced_notional, 2),
             "closed_count": len(self.closed),
             "win_rate": round(len(wins) / len(self.closed), 3) if self.closed else 0.0,
             "realized_pnl_usd": round(self.realized_pnl, 2),
@@ -292,6 +379,12 @@ class PaperPortfolio:
                 "day_start_ms": self.day_start_ms, "inception_ms": self.inception_ms,
                 "daily_end": self.daily_end, "closed": self.closed[-200:],
                 "per_trader": self.per_trader, "suspended": list(self.suspended), "trader_pnl_full": self.trader_pnl_full,
+                "suspended_at": self.suspended_at,
+                # open positions + trader nets now persist: a Render restart used to
+                # silently vaporize all open exposure (positions gone, unrealized lost,
+                # no closure records) — an integrity hole in the public track record.
+                "open_positions": [asdict(p) for p in self.open_positions.values()],
+                "trader_net": [[t, c, n] for (t, c), n in self.trader_net.items()],
                 "halted": self.halted}
 
     @classmethod
@@ -313,7 +406,20 @@ class PaperPortfolio:
         pf.closed = state.get("closed", [])
         pf.per_trader = state.get("per_trader", {})
         pf.suspended = set(state.get("suspended", []))
+        pf.suspended_at = {str(k): int(v) for k, v in (state.get("suspended_at") or {}).items()}
         pf.trader_pnl_full = state.get("trader_pnl_full", {})
+        for d in state.get("open_positions") or []:
+            try:
+                p = PaperPosition(**{k: d[k] for k in d if k in PaperPosition.__dataclass_fields__})
+                pf.open_positions[(p.trader, p.coin)] = p
+            except Exception:  # noqa: BLE001 - never let one bad row block resume
+                pass
+        for row in state.get("trader_net") or []:
+            try:
+                t, c, n = row
+                pf.trader_net[(t, c)] = float(n)
+            except Exception:  # noqa: BLE001
+                pass
         pf.halted = bool(state.get("halted", False))
         pf._equity = pf.start_equity + pf.realized_pnl
         return pf
@@ -352,6 +458,7 @@ class LiveCopyEngine:
             self.pf = PaperPortfolio(start_equity=start_equity, weights=self.weights, own_stop_pct=own_stop_pct)
         self.pf.reset_token = reset_token
         self.mids: dict[str, float] = {}
+        self.mid_ms: dict[str, int] = {}         # coin -> ms of last feed update (staleness guard)
         self._trader_hw: dict[str, float] = {}   # target-wallet equity high-water (drives the DD breaker)
         self._lock = threading.Lock()
         self._ws = None
@@ -377,6 +484,26 @@ class LiveCopyEngine:
                 coins |= {pos.coin for pos in self.pf.open_positions.values()}
                 coins |= watch
                 now = int(time.time() * 1000)
+                # BUILDER-DEX MID POLLING: coins like xyz:GOLD never appear in the main
+                # allMids WS feed (they live on a builder-deployed dex), which is how
+                # positions sat frozen at entry for 6+ days. Poll their dex's mids via
+                # REST so they get real marks; if the dex can't be queried they simply
+                # stay unpriced and the staleness guard handles them honestly.
+                dexes = {c.split(":", 1)[0] for c in coins if ":" in c}
+                for dex in dexes:
+                    try:
+                        dm = self.client.all_mids(dex=dex) or {}
+                        with self._lock:
+                            for k, v in dm.items():
+                                try:
+                                    px = float(v)
+                                except (TypeError, ValueError):
+                                    continue
+                                key = k if ":" in k else f"{dex}:{k}"
+                                self.mids[key] = px
+                                self.mid_ms[key] = now
+                    except Exception:  # noqa: BLE001 - degrade to "unpriced", never fake
+                        pass
                 for coin in list(coins):
                     # measured half-spread from the live book
                     try:
@@ -395,6 +522,18 @@ class LiveCopyEngine:
                         rates = [float(h["fundingRate"]) * 1e4 for h in hist if "fundingRate" in h]
                         if rates:
                             self.pf.funding_hr[coin] = sum(rates) / len(rates)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # average daily move (%) over ~14 days -> drives the vol-aware stop
+                    try:
+                        cs = self.client.candles(coin, "1d", now - 14 * 86_400_000, now) or []
+                        moves = []
+                        for c in cs:
+                            o, cl = float(c.get("o", 0) or 0), float(c.get("c", 0) or 0)
+                            if o > 0:
+                                moves.append(abs(cl / o - 1) * 100.0)
+                        if len(moves) >= 5:
+                            self.pf.daily_vol[coin] = sum(moves) / len(moves)
                     except Exception:  # noqa: BLE001
                         pass
                 # target-wallet drawdown breaker: stop copying a wallet whose OWN account
@@ -446,9 +585,40 @@ class LiveCopyEngine:
             new_weights = dict(new_basket)
             with self._lock:
                 added = [a for a, _ in new_basket if a not in self.weights]
+                removed = [a for a in self.weights if a not in new_weights]
                 self.weights = new_weights
                 self.pf.weights = new_weights
                 self.basket = new_basket
+                # ON_DELIST policy: a wallet that dropped out of the eligible basket
+                # while we hold its positions. "ride" keeps them; "close" exits at the
+                # next mark; "tighten_stop" (default) halves the remaining stop room.
+                policy = C.PORTFOLIO.get("on_delist", "ride")
+                now_ms = int(time.time() * 1000)
+                for addr in removed:
+                    keys = [k for k in self.pf.open_positions if k[0] == addr]
+                    if not keys:
+                        continue
+                    if policy == "close":
+                        max_age = getattr(C, "STALE_MARK_MAX_S", 900) * 1000
+                        closed_n = 0
+                        for k in keys:
+                            coin = self.pf.open_positions[k].coin
+                            mk = self.mids.get(coin)
+                            fresh = mk and (now_ms - self.mid_ms.get(coin, 0) <= max_age)
+                            if fresh:   # never close at a stale price; unpriced positions wait
+                                self.pf._close(k, mk, now_ms, reason="delisted")
+                                closed_n += 1
+                        print(f"[livecopy] DELIST: {addr[:6]}… left the basket; closed {closed_n}/{len(keys)} position(s) (unpriced ones held)")
+                    elif policy == "tighten_stop":
+                        mult = C.PORTFOLIO.get("delist_stop_mult", 0.5)
+                        for k in keys:
+                            pos = self.pf.open_positions[k]
+                            pos.stop_pct = round((pos.stop_pct or self.pf.own_stop_pct) * mult, 2)
+                        print(f"[livecopy] DELIST: {addr[:6]}… left the basket; tightened stop to "
+                              f"{mult:.0%} on {len(keys)} open position(s) (no new copies)")
+                    else:
+                        print(f"[livecopy] DELIST: {addr[:6]}… left the basket; "
+                              f"{len(keys)} open position(s) ride to stop/TP/close")
             ws = getattr(self, "_ws", None)
             if ws is not None and added:
                 for a in added:
@@ -468,10 +638,12 @@ class LiveCopyEngine:
         ch = msg.get("channel")
         if ch == "allMids":
             mids = (msg.get("data") or {}).get("mids", {})
+            now = int(time.time() * 1000)
             with self._lock:
                 for coin, px in mids.items():
                     try:
                         self.mids[coin] = float(px)
+                        self.mid_ms[coin] = now
                     except (TypeError, ValueError):
                         pass
         elif ch == "userFills":
@@ -487,6 +659,8 @@ class LiveCopyEngine:
                     continue
                 with self._lock:
                     mark = self.mids.get(coin) or float(f.get("px", 0) or 0)
+                    if coin in self.mid_ms:   # sync freshness so _open's staleness check is current
+                        self.pf.mark_ms[coin] = self.mid_ms[coin]
                     self.pf.on_fill(user, coin, dir_str, sz, mark, int(f.get("time", time.time() * 1000)))
 
     def _mtm_loop(self, snapshot_path: str, every_s: int = 5):
@@ -494,8 +668,8 @@ class LiveCopyEngine:
         while True:
             time.sleep(every_s)
             with self._lock:
-                self.pf.mark_to_market(self.mids, int(time.time() * 1000))
-                snap = self.pf.snapshot(self.mids)
+                self.pf.mark_to_market(self.mids, int(time.time() * 1000), self.mid_ms)
+                snap = self.pf.snapshot(self.mids, self.mid_ms)
                 state = self.pf.to_state()
             try:
                 tmp = snapshot_path + ".tmp"

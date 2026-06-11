@@ -110,7 +110,73 @@ def main():
     boundary = NOW - 30 * DAY
     deciles = walk_forward(fills_by_wallet, boundary)
     print("\nWalk-forward summary:", summarize_walk_forward(deciles))
+
+    live_engine_checks()
     print("\n✓ engine ran end-to-end")
+
+
+def live_engine_checks():
+    """Unit checks for the live-copy integrity layer (no network):
+    staleness guard, unpriced-open block, vol-aware stop, suspension review,
+    de-listed-close mirroring, restart persistence of open positions."""
+    from sf.sim.live_copy import PaperPortfolio
+    import sf.config as C
+
+    print("\n--- live engine integrity checks ---")
+    T1, T2 = "0x" + "1" * 40, "0x" + "2" * 40
+    now = NOW
+
+    pf = PaperPortfolio(start_equity=100_000, weights={T1: 0.10, T2: 0.10})
+
+    # 1) unpriced open is BLOCKED (no fresh mark for the coin)
+    pf.on_fill(T1, "xyz:GOLD", "Open Long", 1.0, 4447.0, now)
+    assert not pf.open_positions, "unpriced coin must not be copied"
+    print("✓ unpriced open blocked (no fresh mark)")
+
+    # 2) priced open works; vol-aware stop computed
+    pf.daily_vol["DOGE"] = 5.0                      # 5%/day mover
+    pf.mark_ms["BTC"] = now; pf.mark_ms["DOGE"] = now
+    pf.on_fill(T1, "BTC", "Open Long", 0.1, 60_000.0, now)
+    pf.on_fill(T2, "DOGE", "Open Long", 1000.0, 0.2, now)
+    assert (T1, "BTC") in pf.open_positions and (T2, "DOGE") in pf.open_positions
+    doge_stop = pf.open_positions[(T2, "DOGE")].stop_pct
+    exp = min(max(C.PORTFOLIO["own_stop_loss_pct"], C.PORTFOLIO["stop_vol_mult"] * 5.0),
+              C.PORTFOLIO["stop_cap_pct"])
+    assert abs(doge_stop - exp) < 0.01, f"vol stop {doge_stop} != {exp}"
+    print(f"✓ vol-aware stop: DOGE stop={doge_stop}% (BTC stop={pf.open_positions[(T1,'BTC')].stop_pct}%)")
+
+    # 3) staleness guard: stale mark -> no PnL, no stop fire, flagged in snapshot
+    stale_ms = {"BTC": now, "DOGE": now - (C.STALE_MARK_MAX_S + 60) * 1000}
+    crash = {"BTC": 60_000.0, "DOGE": 0.05}        # DOGE 'crashed' but mark is stale
+    pf.mark_to_market(crash, now + 1000, stale_ms)
+    assert (T2, "DOGE") in pf.open_positions, "stale price must not fire the stop"
+    snap = pf.snapshot(crash, stale_ms)
+    assert snap["data_quality"] == "degraded" and snap["unpriced_count"] == 1
+    drow = [r for r in snap["open_positions"] if r["coin"] == "DOGE"][0]
+    assert drow["stale"] and drow["unreal_usd"] is None, "stale position must show no fake PnL"
+    print(f"✓ staleness guard: degraded quality, unpriced ${snap['unpriced_notional_usd']:.0f} excluded, stop frozen")
+
+    # 4) de-listed trader's close still mirrors
+    pf.weights = {T2: 0.10}                         # T1 de-listed
+    px = pf.open_positions[(T1, "BTC")].entry_px
+    pf.on_fill(T1, "BTC", "Close Long", 0.1, px * 1.01, now + 2000)
+    assert (T1, "BTC") not in pf.open_positions, "de-listed trader close must mirror"
+    assert pf.closed[-1]["reason"] == "trader_closed"
+    print("✓ de-listed trader's close mirrored")
+
+    # 5) suspension auto-review reinstates after SUSPENSION_REVIEW_DAYS
+    pf.suspended.add(T1); pf.suspended_at[T1] = now
+    later = now + int((C.SUSPENSION_REVIEW_DAYS * 86_400_000) + 1000)
+    pf.mark_to_market({"BTC": 60_000.0}, later, {"BTC": later})
+    assert T1 not in pf.suspended, "suspension must auto-review"
+    print(f"✓ suspension auto-review after {C.SUSPENSION_REVIEW_DAYS:.0f}d")
+
+    # 6) restart persistence: open positions + trader_net survive to_state/from_state
+    state = pf.to_state()
+    pf2 = PaperPortfolio.from_state(state, pf.weights, C.PORTFOLIO["own_stop_loss_pct"])
+    assert set(pf2.open_positions) == set(pf.open_positions), "open positions must survive restart"
+    assert pf2.trader_net == pf.trader_net, "trader nets must survive restart"
+    print(f"✓ restart persistence: {len(pf2.open_positions)} open position(s) restored")
 
 
 if __name__ == "__main__":

@@ -73,9 +73,21 @@ AUTO_BAN = {
 
 # Empirical-Bayes shrinkage: small samples get pulled toward the population mean.
 # effective_score = (n/(n+K))*raw + (K/(n+K))*prior_mean
-BUILD_VERSION = "2026-06-05-take-profit-15"  # bump on each shipped build so /health proves what is actually running
+BUILD_VERSION = "2026-06-11-staleness-volstop-wf3"  # bump on each shipped build so /health proves what is actually running
 LIVE_BREAKER_LOSS_PCT = 2.0   # live circuit breaker: suspend a basket wallet once its copied P&L falls below -2% of its allotted slice
 LIVE_BREAKER_MIN_TRADES = 5   # ...but only after this many live trades, so one unlucky trade cannot trip it
+SUSPENSION_REVIEW_DAYS = 7.0  # auto-reconsider a circuit-breaker suspension after this many days (breaker counter resets; it can re-fire)
+
+# ----------------------------------------------------------------------------
+# Data-integrity / staleness guard (no-fake-data rule, enforced in the engine)
+# ----------------------------------------------------------------------------
+# Observed in production: builder-dex coins (xyz:GOLD etc.) never appear in the
+# main allMids feed, so their paper positions sat frozen at entry for 6+ days —
+# unmarkable capital with a stop that can never fire. Separately, the mids cache
+# retained the LAST price forever, so a dead feed would silently keep computing
+# PnL on stale prices. Both violate the no-fake-data rule.
+STALE_MARK_MAX_S = 900        # a mark older than this is untrusted: position flagged stale, PnL frozen, stop/TP disabled until fresh data
+ALLOW_UNPRICED_OPENS = False  # NEVER open a paper position in a coin we cannot currently mark (no live mid = no copy)
 GLOBAL_KILL_DRAWDOWN_PCT = 15.0  # portfolio kill switch: halt ALL copying + close everything if equity falls 15% from start
 TARGET_WALLET_DD_PCT = 50.0      # stop copying a wallet whose OWN account falls >50% from its peak while we follow it
 SHRINKAGE_K = 25              # was 60; the walk-forward showed the RAW score separates survivors at predictive grade while the heavily-shrunk score did not — 60 was over-compressing real signal. The 30-trade/30-day COPY gate independently protects the basket from thin samples, so a lighter K is safe.
@@ -123,8 +135,21 @@ PORTFOLIO = {
     "max_weight_per_trader": 0.10,
     "max_weight_per_asset": 0.15,   # tightened 0.25->0.15: cap any single COIN's share of the book (HYPE-pileup fix), enforced live
     "max_portfolio_leverage": 3.0,
-    "own_stop_loss_pct": 5.0,     # hardcoded 5% paper stop (was 12%); tighter -> more stop-outs, measured vs 12%
+    "own_stop_loss_pct": 5.0,     # FLOOR for the per-position stop (see stop_vol_mult below)
     "take_profit_pct": 15.0,      # take-profit: close a copied position once net gain >= 15% (caps upside, locks gains; tunable)
+    # Volatility-aware stop: a flat 5% on a coin that moves 5% in a normal day is a
+    # coin-flip, not risk control (12 of the first 21 live closes were -5% whipsaw
+    # stops on volatile alts whose traders went on to manage the position fine).
+    # Per-position stop = clamp(stop_vol_mult x coin's avg daily move, own_stop_loss_pct .. stop_cap_pct).
+    # Falls back to own_stop_loss_pct when no vol data. Set stop_vol_mult to 0 to disable.
+    "stop_vol_mult": 1.5,
+    "stop_cap_pct": 10.0,
+    # When a wallet drops out of the eligible basket while we still hold its positions:
+    #   "ride"         = keep positions until stop/TP/trader-close (old implicit behavior)
+    #   "close"        = close its positions at the next mark
+    #   "tighten_stop" = keep them but halve the remaining stop room (default: de-risk, don't panic-exit)
+    "on_delist": "tighten_stop",
+    "delist_stop_mult": 0.5,
     "capacity_test_sizes": [10_000, 100_000, 1_000_000],
 }
 
