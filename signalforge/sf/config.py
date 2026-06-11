@@ -73,7 +73,7 @@ AUTO_BAN = {
 
 # Empirical-Bayes shrinkage: small samples get pulled toward the population mean.
 # effective_score = (n/(n+K))*raw + (K/(n+K))*prior_mean
-BUILD_VERSION = "2026-06-11-staleness-volstop-wf3"  # bump on each shipped build so /health proves what is actually running
+BUILD_VERSION = "2026-06-11b-phantom-close-fix"  # bump on each shipped build so /health proves what is actually running
 LIVE_BREAKER_LOSS_PCT = 2.0   # live circuit breaker: suspend a basket wallet once its copied P&L falls below -2% of its allotted slice
 LIVE_BREAKER_MIN_TRADES = 5   # ...but only after this many live trades, so one unlucky trade cannot trip it
 SUSPENSION_REVIEW_DAYS = 7.0  # auto-reconsider a circuit-breaker suspension after this many days (breaker counter resets; it can re-fire)

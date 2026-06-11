@@ -178,6 +178,17 @@ def live_engine_checks():
     assert pf2.trader_net == pf.trader_net, "trader nets must survive restart"
     print(f"✓ restart persistence: {len(pf2.open_positions)} open position(s) restored")
 
+    # 7) phantom-close guard: a Close fill while OUR book is flat must NOT open
+    #    an opposite-side mirror (post-deploy state-loss failure mode)
+    pf3 = PaperPortfolio(start_equity=100_000, weights={T1: 0.10})
+    pf3.mark_ms["ETH"] = now
+    pf3.on_fill(T1, "ETH", "Close Long", 1.0, 1600.0, now)
+    assert not pf3.open_positions, "phantom close must not open a short"
+    assert abs(pf3.trader_net.get((T1, "ETH"), 0.0)) < 1e-12
+    pf3.on_fill(T1, "ETH", "Open Long", 1.0, 1600.0, now + 1000)
+    assert (T1, "ETH") in pf3.open_positions, "real open must still work after ignored close"
+    print("✓ phantom-close guard: untracked Close ignored, real Open still mirrors")
+
 
 if __name__ == "__main__":
     main()

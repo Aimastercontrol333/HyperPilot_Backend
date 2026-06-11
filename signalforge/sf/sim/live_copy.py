@@ -128,6 +128,12 @@ class PaperPortfolio:
             return
         key = (trader, coin)
         prev = self.trader_net.get(key, 0.0)
+        # PHANTOM-CLOSE GUARD: a "Close X" fill while OUR book has the trader flat
+        # means they are exiting a position we never mirrored (opened before we
+        # started tracking, or before a deploy that predates net persistence).
+        # Mirroring it would open a phantom OPPOSITE-side position. Ignore it.
+        if abs(prev) < 1e-12 and dir_str.startswith("Close"):
+            return
         if "Liquidat" in dir_str:
             new = 0.0
         else:
