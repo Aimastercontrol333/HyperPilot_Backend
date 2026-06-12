@@ -189,6 +189,25 @@ def live_engine_checks():
     assert (T1, "ETH") in pf3.open_positions, "real open must still work after ignored close"
     print("✓ phantom-close guard: untracked Close ignored, real Open still mirrors")
 
+    # 8) on-demand builder-coin pricing: a fill in an unpriced xyz: coin (no prior
+    #    poll, so mark_ms has no entry) must still open by fetching the price now.
+    #    The fill carries the trader's px as the mark (83.468); the fetcher supplies
+    #    the freshness stamp that the staleness guard requires.
+    pf4 = PaperPortfolio(start_equity=100_000, weights={T1: 0.10})
+    pf4._price_fetcher = lambda coin: (83.468, now) if coin == "xyz:CL" else None
+    assert "xyz:CL" not in pf4.mark_ms, "precondition: coin not yet priced by any poll"
+    pf4.on_fill(T1, "xyz:CL", "Open Long", 10.0, 83.468, now)
+    assert (T1, "xyz:CL") in pf4.open_positions, "builder coin must open via on-demand price"
+    assert pf4.open_positions[(T1, "xyz:CL")].entry_px > 0
+    print("✓ on-demand builder-coin pricing: xyz:CL opened (deadlock fixed)")
+
+    # 9) still blocked if the fetcher has no price (honest, no fake)
+    pf5 = PaperPortfolio(start_equity=100_000, weights={T1: 0.10})
+    pf5._price_fetcher = lambda coin: None
+    pf5.on_fill(T1, "xyz:NOPE", "Open Long", 10.0, 1.23, now)
+    assert not pf5.open_positions, "unfetchable builder coin must still be skipped"
+    print("✓ unfetchable builder coin still skipped (no fake price)")
+
 
 if __name__ == "__main__":
     main()

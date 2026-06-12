@@ -85,6 +85,7 @@ class PaperPortfolio:
     mark_ms: dict = field(default_factory=dict)           # coin -> ms of last FRESH mark (staleness guard)
     suspended_at: dict = field(default_factory=dict)      # full addr -> ms when the breaker fired (drives auto-review)
     _stale_info: dict = field(default_factory=dict)       # last mark-to-market staleness summary (for snapshot)
+    _price_fetcher: object = None                          # optional callable(coin)->(px,ms)|None for on-demand builder-coin pricing
     _equity: float = 0.0
     _last_eq_ms: int = 0
     reset_token: str = ""
@@ -165,6 +166,15 @@ class PaperPortfolio:
         if not getattr(C, "ALLOW_UNPRICED_OPENS", False):
             last = self.mark_ms.get(coin, 0)
             max_age_ms = getattr(C, "STALE_MARK_MAX_S", 900) * 1000
+            if (not last or ts - last > max_age_ms) and self._price_fetcher and ":" in coin:
+                # On-demand: a builder-dex fill can arrive before the periodic poll has
+                # run (startup race). Try to fetch THIS coin's mark now rather than
+                # skip the open forever. Returns (px, ms) or None.
+                got = self._price_fetcher(coin)
+                if got:
+                    mark_px = got[0] if mark_px <= 0 else mark_px
+                    self.mark_ms[coin] = got[1]
+                    last = got[1]
             if not last or ts - last > max_age_ms:
                 print(f"[livecopy] SKIP open {coin} ({trader[:6]}…): no fresh live mark "
                       f"(last {'never' if not last else f'{(ts - last) / 1000:.0f}s ago'}) — unpriced coins are not copied")
@@ -474,6 +484,39 @@ class LiveCopyEngine:
             self.client = HyperliquidClient()
         except Exception:  # noqa: BLE001
             self.client = None
+        # On-demand single-coin price fetch for builder-dex coins, used when a fill
+        # arrives before the periodic poll has priced it (startup race). Cached map
+        # per dex, refreshed at most every 30s, so this never hammers the API.
+        self._dex_cache: dict = {}      # dex -> (ms, {coin: px})
+        self.pf._price_fetcher = self._fetch_builder_price
+
+    def _fetch_builder_price(self, coin: str):
+        """Return (px, ms) for a builder-dex coin like 'xyz:CL', or None. Pulls the
+        whole dex mid map (cheap, one call) and caches it ~30s."""
+        if self.client is None or ":" not in coin:
+            return None
+        dex = coin.split(":", 1)[0]
+        now = int(time.time() * 1000)
+        cached = self._dex_cache.get(dex)
+        if not cached or now - cached[0] > 30_000:
+            try:
+                dm = self.client.all_mids(dex=dex) or {}
+            except Exception:  # noqa: BLE001
+                return None
+            parsed = {}
+            for k, v in dm.items():
+                try:
+                    parsed[k if ":" in k else f"{dex}:{k}"] = float(v)
+                except (TypeError, ValueError):
+                    continue
+            self._dex_cache[dex] = (now, parsed)
+            cached = self._dex_cache[dex]
+            with self._lock:                      # also warm the main caches
+                for kk, pv in parsed.items():
+                    self.mids[kk] = pv
+                    self.mid_ms[kk] = now
+        px = cached[1].get(coin)
+        return (px, cached[0]) if px else None
 
     def _marketdata_loop(self, every_s: int = 300):
         """Populate the portfolio's real-cost caches from Hyperliquid: the measured
@@ -484,21 +527,27 @@ class LiveCopyEngine:
         if self.client is None:
             return
         watch = set(getattr(C, "MAJOR_COINS", set())) | set(getattr(C, "MID_COINS", set()))
+        # Builder dexes to price PROACTIVELY every cycle. These wallets trade tokenized
+        # stocks/commodities (xyz:) and pre-IPO/venture markets (vntl:) heavily, and
+        # those coins are NOT in the main allMids WS feed. We must poll their mids
+        # BEFORE a wallet opens one — otherwise the first open is skipped as "unpriced"
+        # and, because the skip means the coin never enters an open position, the old
+        # discover-from-open-positions logic would never start polling it (a deadlock).
+        builder_dexes = set(getattr(C, "BUILDER_DEXES", {"xyz", "vntl"}))
         while True:
             try:
                 coins = set(self.pf.spread_bps)  # keep refreshing what we've seen
                 coins |= {pos.coin for pos in self.pf.open_positions.values()}
                 coins |= watch
                 now = int(time.time() * 1000)
-                # BUILDER-DEX MID POLLING: coins like xyz:GOLD never appear in the main
-                # allMids WS feed (they live on a builder-deployed dex), which is how
-                # positions sat frozen at entry for 6+ days. Poll their dex's mids via
-                # REST so they get real marks; if the dex can't be queried they simply
-                # stay unpriced and the staleness guard handles them honestly.
-                dexes = {c.split(":", 1)[0] for c in coins if ":" in c}
+                # BUILDER-DEX MID POLLING (proactive): poll every known builder dex's
+                # full mid map each cycle so prices EXIST before the first open. Keys
+                # come back already prefixed (e.g. "xyz:CL"), so use them verbatim.
+                dexes = builder_dexes | {c.split(":", 1)[0] for c in coins if ":" in c}
                 for dex in dexes:
                     try:
                         dm = self.client.all_mids(dex=dex) or {}
+                        n_set = 0
                         with self._lock:
                             for k, v in dm.items():
                                 try:
@@ -508,8 +557,11 @@ class LiveCopyEngine:
                                 key = k if ":" in k else f"{dex}:{k}"
                                 self.mids[key] = px
                                 self.mid_ms[key] = now
-                    except Exception:  # noqa: BLE001 - degrade to "unpriced", never fake
-                        pass
+                                n_set += 1
+                        if n_set:
+                            print(f"[livecopy] priced {n_set} {dex}: coins from builder dex")
+                    except Exception as e:  # noqa: BLE001 - degrade to "unpriced", never fake
+                        print(f"[livecopy] builder-dex '{dex}' mid poll failed: {e}")
                 for coin in list(coins):
                     # measured half-spread from the live book
                     try:
@@ -703,7 +755,8 @@ class LiveCopyEngine:
         if websocket is None:
             raise RuntimeError("websocket-client not installed. Run: pip install websocket-client")
         threading.Thread(target=self._mtm_loop, args=(snapshot_path,), daemon=True).start()
-        threading.Thread(target=self._marketdata_loop, daemon=True).start()
+        threading.Thread(target=self._marketdata_loop,
+                          args=(getattr(C, "MARKETDATA_EVERY_S", 120),), daemon=True).start()
         if basket_provider is not None:
             threading.Thread(target=self._refresh_loop, args=(refresh_every_s,), daemon=True).start()
         ws = websocket.WebSocketApp(self.ws_url, on_open=self._on_open, on_message=self._on_message)

@@ -73,7 +73,7 @@ AUTO_BAN = {
 
 # Empirical-Bayes shrinkage: small samples get pulled toward the population mean.
 # effective_score = (n/(n+K))*raw + (K/(n+K))*prior_mean
-BUILD_VERSION = "2026-06-11b-phantom-close-fix"  # bump on each shipped build so /health proves what is actually running
+BUILD_VERSION = "2026-06-12-builderdex-pricing"  # bump on each shipped build so /health proves what is actually running
 LIVE_BREAKER_LOSS_PCT = 2.0   # live circuit breaker: suspend a basket wallet once its copied P&L falls below -2% of its allotted slice
 LIVE_BREAKER_MIN_TRADES = 5   # ...but only after this many live trades, so one unlucky trade cannot trip it
 SUSPENSION_REVIEW_DAYS = 7.0  # auto-reconsider a circuit-breaker suspension after this many days (breaker counter resets; it can re-fire)
@@ -88,6 +88,13 @@ SUSPENSION_REVIEW_DAYS = 7.0  # auto-reconsider a circuit-breaker suspension aft
 # PnL on stale prices. Both violate the no-fake-data rule.
 STALE_MARK_MAX_S = 900        # a mark older than this is untrusted: position flagged stale, PnL frozen, stop/TP disabled until fresh data
 ALLOW_UNPRICED_OPENS = False  # NEVER open a paper position in a coin we cannot currently mark (no live mid = no copy)
+# Builder-deployed perp dexes whose coins (xyz:AAPL, vntl:SPACEX, ...) are NOT in the
+# main allMids WS feed. The live engine proactively polls each one's mids every cycle
+# so these coins are priced BEFORE a basket wallet opens them. These wallets trade
+# tokenized stocks / commodities / pre-IPO markets heavily, so this is essential, not
+# optional. Add a dex string here if discovery surfaces a new one.
+BUILDER_DEXES = {"xyz", "vntl"}
+MARKETDATA_EVERY_S = 120      # builder-dex mid + spread/funding/vol refresh cadence (was 300; tighter so builder-coin marks stay fresh and a new open isn't blocked waiting for the next poll)
 GLOBAL_KILL_DRAWDOWN_PCT = 15.0  # portfolio kill switch: halt ALL copying + close everything if equity falls 15% from start
 TARGET_WALLET_DD_PCT = 50.0      # stop copying a wallet whose OWN account falls >50% from its peak while we follow it
 SHRINKAGE_K = 25              # was 60; the walk-forward showed the RAW score separates survivors at predictive grade while the heavily-shrunk score did not — 60 was over-compressing real signal. The 30-trade/30-day COPY gate independently protects the basket from thin samples, so a lighter K is safe.
