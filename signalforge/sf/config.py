@@ -48,16 +48,16 @@ assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-9, "Safety Score weights must sum t
 # Auto-pass thresholds (a wallet must clear ALL to be basket-eligible)
 AUTO_PASS = {
     "max_single_trade_loss_pct": 10.0,
-    "max_drawdown_pct": 25.0,            # KEPT strict (the proposed 40-60% loosening was rejected)
-    "avg_leverage": 10.0,
+    "max_drawdown_pct": 25.0,            # KEPT strict (the proposed 40-60% loosening was rejected) — this is a RISK gate, never loosen
+    "avg_leverage": 10.0,                # RISK gate — keep
     "min_sharpe": 1.5,
     "min_trades": 30,                    # COPY gate: scored at 15, copied only with a real sample
-    "min_history_days": 60,              # COPY gate: raised 30 -> 60 days (proposed-rules merge)
+    "min_history_days": 45,              # WIDENED 60 -> 45: was excluding solid 45-60d wallets; 45d + 30 trades is still a real sample. Lets more wallets into the basket (it was stuck at 5 of ~74 scored).
     "min_expectancy_pct": 0.1,           # COPY gate floor: avg round-trip must clear ~0.1%
     "cost_margin_bps": 5.0,              # ...and must beat OUR estimated copy cost by this margin (cost-aware gate)
     # --- proposed-rules merge: size / recency / not-one-lucky-trade. A check is SKIPPED when its value is unknown. ---
     "min_balance_usd": 5000.0,           # skin in the game (applied only when the account could be measured)
-    "min_realized_pnl_usd": 10000.0,     # proven historical profit over the window
+    "min_realized_pnl_usd": 3000.0,      # WIDENED 10000 -> 3000: the $10k floor was the single hardest filter, excluding proven-but-smaller disciplined traders for no risk reason (a $4k-profit wallet with a clean curve is still a valid copy target). Proven profit still required, just not gatekept to whales.
     "max_days_since_trade": 7.0,         # must be currently active
     "max_single_trade_dominance": 0.50,  # reject if one trade is >50% of gross profit (lucky-gambler guard)
     "min_equity_curve_quality": 0.45,    # basket wallet must show a healthy, steady, upward curve (0..1; tunable). Captures "steady upward equity" WITHOUT a win-rate floor.
@@ -73,10 +73,10 @@ AUTO_BAN = {
 
 # Empirical-Bayes shrinkage: small samples get pulled toward the population mean.
 # effective_score = (n/(n+K))*raw + (K/(n+K))*prior_mean
-BUILD_VERSION = "2026-06-12-builderdex-pricing"  # bump on each shipped build so /health proves what is actually running
-LIVE_BREAKER_LOSS_PCT = 2.0   # live circuit breaker: suspend a basket wallet once its copied P&L falls below -2% of its allotted slice
-LIVE_BREAKER_MIN_TRADES = 5   # ...but only after this many live trades, so one unlucky trade cannot trip it
-SUSPENSION_REVIEW_DAYS = 7.0  # auto-reconsider a circuit-breaker suspension after this many days (breaker counter resets; it can re-fire)
+BUILD_VERSION = "2026-06-23-volstop-widen-basket"  # bump on each shipped build so /health proves what is actually running
+LIVE_BREAKER_LOSS_PCT = 4.0   # live circuit breaker: suspend a basket wallet once its copied P&L falls below this % of its allotted slice. Widened 2->4: at 2% a single vol-aware stop (~5-9%) on one slice could trip it, which benched ALL FIVE wallets at once. 4% needs a genuine losing streak, not one stop.
+LIVE_BREAKER_MIN_TRADES = 6   # ...but only after this many live trades, so a couple unlucky early trades cannot trip it (was 5)
+SUSPENSION_REVIEW_DAYS = 3.0  # auto-reconsider a circuit-breaker suspension after this many days (was 7). Faster review so a wallet that hit a rough patch returns to the basket sooner instead of leaving it dark.
 
 # ----------------------------------------------------------------------------
 # Data-integrity / staleness guard (no-fake-data rule, enforced in the engine)
@@ -88,13 +88,6 @@ SUSPENSION_REVIEW_DAYS = 7.0  # auto-reconsider a circuit-breaker suspension aft
 # PnL on stale prices. Both violate the no-fake-data rule.
 STALE_MARK_MAX_S = 900        # a mark older than this is untrusted: position flagged stale, PnL frozen, stop/TP disabled until fresh data
 ALLOW_UNPRICED_OPENS = False  # NEVER open a paper position in a coin we cannot currently mark (no live mid = no copy)
-# Builder-deployed perp dexes whose coins (xyz:AAPL, vntl:SPACEX, ...) are NOT in the
-# main allMids WS feed. The live engine proactively polls each one's mids every cycle
-# so these coins are priced BEFORE a basket wallet opens them. These wallets trade
-# tokenized stocks / commodities / pre-IPO markets heavily, so this is essential, not
-# optional. Add a dex string here if discovery surfaces a new one.
-BUILDER_DEXES = {"xyz", "vntl"}
-MARKETDATA_EVERY_S = 120      # builder-dex mid + spread/funding/vol refresh cadence (was 300; tighter so builder-coin marks stay fresh and a new open isn't blocked waiting for the next poll)
 GLOBAL_KILL_DRAWDOWN_PCT = 15.0  # portfolio kill switch: halt ALL copying + close everything if equity falls 15% from start
 TARGET_WALLET_DD_PCT = 50.0      # stop copying a wallet whose OWN account falls >50% from its peak while we follow it
 SHRINKAGE_K = 25              # was 60; the walk-forward showed the RAW score separates survivors at predictive grade while the heavily-shrunk score did not — 60 was over-compressing real signal. The 30-trade/30-day COPY gate independently protects the basket from thin samples, so a lighter K is safe.
@@ -148,9 +141,18 @@ PORTFOLIO = {
     # coin-flip, not risk control (12 of the first 21 live closes were -5% whipsaw
     # stops on volatile alts whose traders went on to manage the position fine).
     # Per-position stop = clamp(stop_vol_mult x coin's avg daily move, own_stop_loss_pct .. stop_cap_pct).
-    # Falls back to own_stop_loss_pct when no vol data. Set stop_vol_mult to 0 to disable.
+    # Falls back to a vol-class default when no candle data (see below). Set stop_vol_mult to 0 to disable.
     "stop_vol_mult": 1.5,
-    "stop_cap_pct": 10.0,
+    "stop_cap_pct": 12.0,         # widened 10->12: builder-dex equities/commodities (SPACEX, oil) routinely swing >5%/day
+    # FALLBACK stop when a coin has no daily-candle vol data. The old code fell back to
+    # the 5% FLOOR, which is exactly wrong: the coins missing candle data are the
+    # builder-dex synthetics (xyz:/vntl: — stocks, oil, gold, pre-IPO) that are the MOST
+    # volatile, and a tight 5% stop on them caused ~92% of realized losses (4 trades,
+    # -$1.5k, all flat -5% whipsaws). Give un-pricable-vol coins a sensible WIDE default
+    # instead of the tight floor.
+    "stop_fallback_builder_pct": 9.0,   # default stop for xyz:/vntl: coins with no candle vol
+    "stop_fallback_other_pct": 6.5,     # default stop for any other coin missing vol data
+    "builder_dex_prefixes": ("xyz:", "vntl:"),
     # When a wallet drops out of the eligible basket while we still hold its positions:
     #   "ride"         = keep positions until stop/TP/trader-close (old implicit behavior)
     #   "close"        = close its positions at the next mark
