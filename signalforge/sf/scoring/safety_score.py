@@ -110,6 +110,22 @@ def _auto_ban(m: WalletMetrics) -> list[str]:
     # crude wash/bot heuristic: implausibly high frequency with ~0 net edge
     if m.extra.get("freq_per_day", 0) > 50 and abs(m.expectancy_pct) < 0.02:
         reasons.append("wash_or_bot_pattern")
+    # --- 2026-06-23 autopsy-derived bans (see AUTO_BAN comment) ---
+    # 1) Negative historical expectancy: the strongest forward-blowup predictor. A wallet
+    #    that loses money per trade in its OWN history should never be copyable. (Guarded:
+    #    only fires on a real, measured expectancy, and only when clearly below the floor.)
+    exp_floor = C.AUTO_BAN.get("ban_expectancy_below_pct")
+    if exp_floor is not None and m.expectancy_pct is not None \
+            and m.n_trades >= C.MIN_TRADES and m.expectancy_pct <= exp_floor:
+        reasons.append("negative_expectancy")
+    # 2) High drawdown AND ugly equity curve TOGETHER (either alone is allowed; the
+    #    COMBINATION is the blow-up fingerprint: 24%DD/0.08-quality vs 14%/0.29 survivors).
+    dd_lim = C.AUTO_BAN.get("ban_dd_combo_drawdown_pct")
+    eqq_lim = C.AUTO_BAN.get("ban_dd_combo_eqq_below")
+    eqq = getattr(m, "equity_curve_quality", None)
+    if dd_lim is not None and eqq_lim is not None and eqq is not None \
+            and m.max_drawdown_pct >= dd_lim and eqq <= eqq_lim:
+        reasons.append("high_drawdown_ugly_curve")
     return reasons
 
 

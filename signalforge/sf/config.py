@@ -69,11 +69,21 @@ AUTO_BAN = {
     "max_leverage_ever": 40.0,    # used 40x+ consistently
     "max_liquidations": 0,        # any forced liquidation in window = ban
     # martingale / no-stop-loss / wash-bot detected -> handled in scoring logic
+    # --- 2026-06-23: autopsy-derived bans (10 blow-ups vs 43 survivors among gate-kept wallets) ---
+    # The autopsy found the wallets that blew up FORWARD were already showing it in their
+    # HISTORY: negative expectancy (blow-ups avg -0.28% vs survivors +0.38%), and a deadly
+    # COMBINATION of high drawdown + ugly equity curve (blow-ups 24%DD/0.08 quality vs
+    # survivors 14%DD/0.29). Sharpe/leverage/win-rate did NOT separate them (high Sharpe
+    # gave false comfort). These two rules ban exactly the historical fingerprint that
+    # preceded forward blow-ups.
+    "ban_expectancy_below_pct": -0.10,   # negative per-trade edge in their own history -> ban (survivors were +0.38%)
+    "ban_dd_combo_drawdown_pct": 22.0,   # high drawdown ...
+    "ban_dd_combo_eqq_below": 0.15,      # ...AND an ugly/non-rising equity curve, together -> ban (either alone is allowed)
 }
 
 # Empirical-Bayes shrinkage: small samples get pulled toward the population mean.
 # effective_score = (n/(n+K))*raw + (K/(n+K))*prior_mean
-BUILD_VERSION = "2026-06-23-volstop-widen-basket"  # bump on each shipped build so /health proves what is actually running
+BUILD_VERSION = "2026-06-23-autopsy-bans"  # bump on each shipped build so /health proves what is actually running
 LIVE_BREAKER_LOSS_PCT = 4.0   # live circuit breaker: suspend a basket wallet once its copied P&L falls below this % of its allotted slice. Widened 2->4: at 2% a single vol-aware stop (~5-9%) on one slice could trip it, which benched ALL FIVE wallets at once. 4% needs a genuine losing streak, not one stop.
 LIVE_BREAKER_MIN_TRADES = 6   # ...but only after this many live trades, so a couple unlucky early trades cannot trip it (was 5)
 SUSPENSION_REVIEW_DAYS = 3.0  # auto-reconsider a circuit-breaker suspension after this many days (was 7). Faster review so a wallet that hit a rough patch returns to the basket sooner instead of leaving it dark.

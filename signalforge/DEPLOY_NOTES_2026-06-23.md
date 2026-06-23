@@ -65,3 +65,45 @@ Your 4th walk-forward still says: predicts SURVIVAL, not PROFIT, regime-dependen
 better-calibrated stop and a wider basket give the real edge (if any) a fair chance to
 show — but if the honest answer stays "survival not profit," the fundable product is
 risk-intelligence, not a profit machine. The data leads; we follow it.
+
+---
+
+# UPDATE — build 2026-06-23-autopsy-bans (supersedes -volstop-widen-basket)
+
+The blow-up autopsy finished (10 blow-ups vs 43 survivors among 53 gate-kept wallets).
+It found the wallets that blew up FORWARD were already showing it in their HISTORY.
+Added two evidence-based ban rules on top of all the fixes above.
+
+## What the autopsy found (the data behind the change)
+- Blow-ups had NEGATIVE historical expectancy (avg -0.28%); survivors POSITIVE (+0.38%).
+  This was the single strongest separator. Your gates were excluding these from the
+  basket but never BANNING them — now they're banned.
+- Blow-ups had high drawdown AND ugly equity curves TOGETHER (24%DD / 0.08 quality vs
+  survivors 14% / 0.29). Either alone is fine; the COMBINATION is the blow-up fingerprint.
+- Sharpe, leverage, and win-rate did NOT separate blow-ups from survivors — high Sharpe
+  actually gave false comfort (blow-ups 3.0 vs survivors 1.7). Win-rate useless (4th time
+  the data has said so). We did NOT add rules on those — that would be noise.
+
+## Two new ban rules (in AUTO_BAN, tunable)
+1. negative_expectancy: ban any wallet with historical expectancy <= -0.10% (clear loser
+   per trade). Guarded: only fires on a real measured value with >= MIN_TRADES.
+2. high_drawdown_ugly_curve: ban wallets with drawdown >= 22% AND equity-curve-quality
+   <= 0.15 (both together). Either alone is allowed.
+
+Validated against the real autopsy numbers: average blow-up gets banned by both rules;
+average survivor is untouched. Note honestly: one sampled blow-up (0x2d81) had near-flat
+expectancy and tiny drawdown and is NOT caught — it blew up for reasons not visible in
+these features. No heuristic catches a wallet that looked clean and detonated. These rules
+catch the CLEARLY dangerous fingerprint, which is what the ban gates are for.
+
+## Deploy: same as above. /health should show build "2026-06-23-autopsy-bans".
+Expect: some previously-"scored-but-idle" wallets flip to BANNED on the next re-audit
+sweep (that's the negative-expectancy ones being correctly rejected). Eligible count is
+driven by the WIDENED auto-pass gates from the section above, so it should still rise.
+
+## HONEST CEILING (unchanged)
+This makes the ban gates do their job — reject the traders most likely to blow up. It does
+NOT create a profit edge. Your walk-forward still says survival, not profit. Better bans +
+better stops + wider basket give any real edge a fair chance to show over the next clean
+week. If returns still hover at break-even, the honest product is risk-intelligence. Read
+the data after a week; that's the decision point, not another deploy.
